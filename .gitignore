@@ -1,0 +1,4 @@
+/target
+
+# Orchestrator runtime data (session-specific, not committed)
+.orchestrator/

@@ -1,0 +1,649 @@
+#!/usr/bin/env bash
+# =============================================================================
+# orc_agent — fire-and-forget agent orchestration via tmux
+# =============================================================================
+#
+# COMMANDS:
+#   ./orc_agent spawn <role> <goal>           # grid pane
+#   ./orc_agent spawn-window <role> <goal>    # separate window fallback
+#   ./orc_agent done <run_id> <summary>       # subagent reports completion (file-safe)
+#   ./orc_agent reply <pane_id> <message>     # raw send to any pane
+#   ./orc_agent ping <run_id>                 # alive + timeout check
+#   ./orc_agent retry <run_id> [new_goal]     # /new + resend task
+#   ./orc_agent check-all                     # check all agents, notify main of dead/timeout
+#   ./orc_agent list                          # show all agents
+# =============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts"
+ORC_DIR=".orchestrator"
+
+source "$SCRIPT_DIR/lib.sh"
+
+MAX_PER_COLUMN=4
+MIN_PANE_HEIGHT=12
+MIN_PANE_WIDTH=55
+AGENT_TIMEOUT="${ORC_AGENT_TIMEOUT:-180}"
+
+# ---------------------------------------------------------------------------
+# Session
+# ---------------------------------------------------------------------------
+
+resolve_current_session() {
+  local root
+  root=$(get_project_root)
+  local latest_file="$root/$ORC_DIR/latest-session"
+  if [ -f "$latest_file" ]; then
+    cat "$latest_file"
+    return 0
+  fi
+  echo "ERROR: No active session. Run: ./orc start" >&2
+  exit 1
+}
+
+SID=$(resolve_current_session)
+SESSION_DIR=$(get_session_dir "$SID")
+SESSION_NAME=$(resolve_session_name "$SID")
+WORKDIR=$(jq -r '.workdir // "."' "$SESSION_DIR/session.json" 2>/dev/null || pwd)
+
+MAIN_PANE=""
+[ -f "$SESSION_DIR/.main_pane_id" ] && MAIN_PANE=$(cat "$SESSION_DIR/.main_pane_id")
+
+LAYOUT_FILE="$SESSION_DIR/.layout_panes"
+[ ! -f "$LAYOUT_FILE" ] && touch "$LAYOUT_FILE"
+
+TMPL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/templates"
+
+# ---------------------------------------------------------------------------
+# reply — raw tmux send-keys (short messages only!)
+# ---------------------------------------------------------------------------
+
+cmd_reply() {
+  local target_pane="$1"
+  shift
+  local message="$*"
+  message=$(printf '%s' "$message" | tr -d '\033')
+  tmux send-keys -t "$target_pane" -l "$message"
+  sleep 0.5
+  tmux send-keys -t "$target_pane" Enter
+}
+
+# ---------------------------------------------------------------------------
+# done — subagent writes result to FILE, sends short ref to main (safe!)
+# ---------------------------------------------------------------------------
+
+cmd_done() {
+  local run_id="$1"
+  shift
+  local summary="$*"
+
+  local run_dir
+  run_dir=$(get_run_dir "$SID" "$run_id")
+  mkdir -p "$run_dir"
+
+  # Write full result to file
+  printf '%s\n' "$summary" > "$run_dir/result.txt"
+
+  # Mark done
+  date +%s > "$run_dir/.done_time"
+
+  # Send SHORT safe notification to main pane (no special chars issues)
+  # Truncate to 200 chars for send-keys safety
+  local short
+  short=$(printf '%.200s' "$summary")
+  # Escape quotes for tmux
+  short=$(printf '%s' "$short" | sed "s/'/'\\\\''/g" | sed 's/"/\\"/g')
+
+  local notify="$run_id: $short"
+  if [ ${#summary} -gt 200 ]; then
+    notify="$notify ... [FULL: $run_dir/result.txt]"
+  fi
+
+  if [ -n "$MAIN_PANE" ] && pane_alive "$MAIN_PANE"; then
+    tmux send-keys -t "$MAIN_PANE" -l "$notify"
+    sleep 0.5
+    tmux send-keys -t "$MAIN_PANE" Enter
+  fi
+
+  log_event "$SESSION_DIR" "info" "done $run_id"
+  echo "DONE $run_id — result in $run_dir/result.txt"
+}
+
+# ---------------------------------------------------------------------------
+# Layout helpers
+# ---------------------------------------------------------------------------
+
+equalize_layout() {
+  local total
+  total=$(wc -l < "$LAYOUT_FILE" | tr -d ' ')
+  [ "$total" -eq 0 ] && return
+
+  local num_cols=$(( (total - 1) / MAX_PER_COLUMN + 1 ))
+  local win_width win_height
+  win_width=$(tmux display-message -t "$SESSION_NAME" -p '#{window_width}' 2>/dev/null || echo 200)
+  win_height=$(tmux display-message -t "$SESSION_NAME" -p '#{window_height}' 2>/dev/null || echo 50)
+
+  local main_width=$((win_width * 25 / 100))
+  [ "$main_width" -lt 40 ] && main_width=40
+  tmux resize-pane -t "$MAIN_PANE" -x "$main_width" 2>/dev/null || true
+
+  local agent_width=$(( (win_width - main_width - 1) / num_cols ))
+  local line=1
+  while [ "$line" -le "$total" ]; do
+    local col=$(( (line - 1) / MAX_PER_COLUMN ))
+    local col_start=$(( col * MAX_PER_COLUMN + 1 ))
+    local col_end=$(( (col + 1) * MAX_PER_COLUMN ))
+    [ "$col_end" -gt "$total" ] && col_end="$total"
+    local agents_in_col=$(( col_end - col_start + 1 ))
+    local row_height=$(( (win_height - 1) / agents_in_col ))
+
+    local row="$col_start"
+    while [ "$row" -le "$col_end" ]; do
+      local pane
+      pane=$(sed -n "${row}p" "$LAYOUT_FILE")
+      [ -z "$pane" ] && { row=$((row + 1)); continue; }
+      tmux resize-pane -t "$pane" -y "$row_height" 2>/dev/null || true
+      [ "$row" -eq "$col_start" ] && tmux resize-pane -t "$pane" -x "$agent_width" 2>/dev/null || true
+      row=$((row + 1))
+    done
+    line=$((col_end + 1))
+  done
+}
+
+check_viewport() {
+  local total
+  total=$(wc -l < "$LAYOUT_FILE" | tr -d ' ')
+  local num_cols_needed=$(( total / MAX_PER_COLUMN + 1 ))
+  local rows_in_target_col=$(( total % MAX_PER_COLUMN + 1 ))
+
+  local win_width win_height
+  win_width=$(tmux display-message -t "$SESSION_NAME" -p '#{window_width}' 2>/dev/null || echo 200)
+  win_height=$(tmux display-message -t "$SESSION_NAME" -p '#{window_height}' 2>/dev/null || echo 50)
+
+  local main_width=$((win_width * 25 / 100))
+  [ "$main_width" -lt 40 ] && main_width=40
+
+  local agent_width=$(( (win_width - main_width) / num_cols_needed ))
+  local row_height=$(( win_height / rows_in_target_col ))
+  [ "$agent_width" -ge "$MIN_PANE_WIDTH" ] && [ "$row_height" -ge "$MIN_PANE_HEIGHT" ]
+}
+
+# ---------------------------------------------------------------------------
+# Safe pane creation: snapshot before/after
+# ---------------------------------------------------------------------------
+
+create_pane_split() {
+  local direction="$1"
+  local target="$2"
+  local size_arg="${3:-}"
+
+  local before
+  before=$(tmux list-panes -s -t "$SESSION_NAME" -F '#{pane_id}' | sort)
+
+  if [ -n "$size_arg" ]; then
+    tmux split-window $direction -t "$target" -l "$size_arg"
+  else
+    tmux split-window $direction -t "$target"
+  fi
+
+  local after
+  after=$(tmux list-panes -s -t "$SESSION_NAME" -F '#{pane_id}' | sort)
+
+  comm -13 <(echo "$before") <(echo "$after") | head -1
+}
+
+# ---------------------------------------------------------------------------
+# Build task prompt with role templates + ACK + done command
+# ---------------------------------------------------------------------------
+
+build_task_prompt() {
+  local role="$1"
+  local run_id="$2"
+  local run_dir="$3"
+  local goal="$4"
+
+  local role_profile=""
+  [ -f "$TMPL_DIR/specs/${role}.md" ] && role_profile=$(cat "$TMPL_DIR/specs/${role}.md")
+
+  local role_prompt=""
+  [ -f "$TMPL_DIR/prompts/subagent-${role}.md" ] && role_prompt=$(cat "$TMPL_DIR/prompts/subagent-${role}.md")
+
+  cat <<EOF
+You are a $role subagent ($run_id).
+
+## ROLE PROFILE
+$role_profile
+
+## ROLE-SPECIFIC INSTRUCTIONS
+$role_prompt
+
+## YOUR TASK
+$goal
+
+## SCOPE CONSTRAINTS
+- You are ONLY a $role. Do NOT do work outside this role.
+- Do NOT modify files unless your role explicitly requires it (only reviewer/verifier may suggest changes, explorer NEVER modifies).
+- Do NOT answer the end user. Your output is for the main orchestrator agent only.
+- Stay strictly within the task scope above.
+
+## STEP 1: ACKNOWLEDGE (do this FIRST)
+Immediately run this bash command to confirm you received the task:
+\`\`\`bash
+./orc_agent reply $MAIN_PANE "$run_id: ACK — starting $role task"
+\`\`\`
+
+## STEP 2: DO THE WORK
+Execute the task within scope.
+
+## STEP 3: REPORT RESULT
+When done, run this bash command to send your result:
+\`\`\`bash
+./orc_agent done $run_id "Your concise result here. Key findings, conclusions, recommendations."
+\`\`\`
+
+This safely writes your result to a file and notifies the main agent.
+If you need to include detailed/structured output, also write to \`$run_dir/handoff.md\` before calling done.
+
+## TIMEOUT
+You have ${AGENT_TIMEOUT}s. Work efficiently. ACK immediately, then work, then report.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Start opencode + wait readiness
+# ---------------------------------------------------------------------------
+
+start_opencode_in_pane() {
+  local pane="$1"
+  local run_dir="$2"
+
+  tmux send-keys -t "$pane" "cd $WORKDIR && opencode" Enter
+  tmux pipe-pane -t "$pane" -o "cat >> $run_dir/transcript.log"
+  tmux select-pane -t "$MAIN_PANE" 2>/dev/null || true
+
+  sleep 5
+  for _ in $(seq 1 40); do
+    local content
+    content=$(tmux capture-pane -t "$pane" -p -S -5 2>/dev/null || echo "")
+    if echo "$content" | grep -qE '(Ask anything|ctrl\+p commands|MCP /status)'; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+send_task_to_pane() {
+  local pane="$1"
+  local prompt="$2"
+  tmux send-keys -t "$pane" -l "$prompt"
+  sleep 0.5
+  tmux send-keys -t "$pane" Enter
+}
+
+record_spawn_time() {
+  date +%s > "$1/.spawn_time"
+}
+
+# ---------------------------------------------------------------------------
+# spawn — grid layout
+# ---------------------------------------------------------------------------
+
+cmd_spawn() {
+  local role="$1"
+  shift
+  local goal="$*"
+
+  case "$role" in
+    researcher|explorer|reviewer|summarizer|verifier) ;;
+    *) echo "ERROR: Invalid role '$role'" >&2; exit 1 ;;
+  esac
+
+  if ! check_viewport; then
+    echo "VIEWPORT_FULL: Not enough space. Use: ./orc_agent spawn-window $role \"$goal\""
+    exit 2
+  fi
+
+  local run_id
+  run_id=$(generate_run_id "$SESSION_DIR")
+  local run_dir
+  run_dir=$(get_run_dir "$SID" "$run_id")
+  mkdir -p "$run_dir"
+
+  local total
+  total=$(wc -l < "$LAYOUT_FILE" | tr -d ' ')
+  local target_col=$(( total / MAX_PER_COLUMN ))
+  local target_row=$(( total % MAX_PER_COLUMN ))
+
+  local new_pane=""
+  if [ "$total" -eq 0 ]; then
+    new_pane=$(create_pane_split "-h" "$MAIN_PANE" "75%")
+  elif [ "$target_row" -eq 0 ]; then
+    local prev_first_line=$(( (target_col - 1) * MAX_PER_COLUMN + 1 ))
+    local prev_first_pane
+    prev_first_pane=$(sed -n "${prev_first_line}p" "$LAYOUT_FILE")
+    new_pane=$(create_pane_split "-fh" "$prev_first_pane")
+  else
+    local last_pane
+    last_pane=$(sed -n "${total}p" "$LAYOUT_FILE")
+    new_pane=$(create_pane_split "-v" "$last_pane")
+  fi
+
+  if [ -z "$new_pane" ]; then
+    echo "SPAWN_ERROR: split-window failed" >&2
+    exit 1
+  fi
+
+  echo "$new_pane" >> "$LAYOUT_FILE"
+  echo "$new_pane" > "$run_dir/.pane_id"
+  printf '{"run_id":"%s","role":"%s","pane_id":"%s","goal":"%s","col":%d,"row":%d,"spawned_at":"%s"}\n' \
+    "$run_id" "$role" "$new_pane" "$(echo "$goal" | tr '"' "'")" "$target_col" "$target_row" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    > "$run_dir/.agent_meta.json"
+
+  equalize_layout
+  record_spawn_time "$run_dir"
+
+  if ! start_opencode_in_pane "$new_pane" "$run_dir"; then
+    echo "SPAWN_ERROR $run_id $new_pane $role — OpenCode not ready"
+    exit 1
+  fi
+
+  local task_prompt
+  task_prompt=$(build_task_prompt "$role" "$run_id" "$run_dir" "$goal")
+  send_task_to_pane "$new_pane" "$task_prompt"
+
+  log_event "$SESSION_DIR" "info" "spawned $run_id ($role) pane=$new_pane c${target_col}r${target_row}"
+  echo "SPAWNED $run_id $new_pane $role (c${target_col}r${target_row} timeout:${AGENT_TIMEOUT}s)"
+}
+
+# ---------------------------------------------------------------------------
+# spawn-window — fallback
+# ---------------------------------------------------------------------------
+
+cmd_spawn_window() {
+  local role="$1"
+  shift
+  local goal="$*"
+
+  case "$role" in
+    researcher|explorer|reviewer|summarizer|verifier) ;;
+    *) echo "ERROR: Invalid role '$role'" >&2; exit 1 ;;
+  esac
+
+  local run_id
+  run_id=$(generate_run_id "$SESSION_DIR")
+  local run_dir
+  run_dir=$(get_run_dir "$SID" "$run_id")
+  mkdir -p "$run_dir"
+
+  local win_name="${role}-${run_id}"
+  tmux new-window -t "$SESSION_NAME" -n "$win_name" -d "bash"
+  local new_pane
+  new_pane=$(tmux list-panes -t "$SESSION_NAME:$win_name" -F '#{pane_id}' | head -1)
+
+  echo "$new_pane" > "$run_dir/.pane_id"
+  printf '{"run_id":"%s","role":"%s","pane_id":"%s","window":"%s","goal":"%s","col":-1,"row":-1,"spawned_at":"%s"}\n' \
+    "$run_id" "$role" "$new_pane" "$win_name" "$(echo "$goal" | tr '"' "'")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    > "$run_dir/.agent_meta.json"
+
+  record_spawn_time "$run_dir"
+  tmux select-window -t "$SESSION_NAME":main 2>/dev/null || true
+
+  if ! start_opencode_in_pane "$new_pane" "$run_dir"; then
+    echo "SPAWN_ERROR $run_id $new_pane $role — not ready"
+    exit 1
+  fi
+
+  local task_prompt
+  task_prompt=$(build_task_prompt "$role" "$run_id" "$run_dir" "$goal")
+  send_task_to_pane "$new_pane" "$task_prompt"
+
+  log_event "$SESSION_DIR" "info" "spawned $run_id ($role) window=$win_name"
+  echo "SPAWNED $run_id $new_pane $role (window: $win_name)"
+}
+
+# ---------------------------------------------------------------------------
+# ping
+# ---------------------------------------------------------------------------
+
+cmd_ping() {
+  local run_id="$1"
+  local run_dir
+  run_dir=$(get_run_dir "$SID" "$run_id")
+  [ ! -d "$run_dir" ] && { echo "ERROR: $run_id not found"; exit 1; }
+
+  local pane role
+  pane=$(cat "$run_dir/.pane_id" 2>/dev/null || echo "")
+  role=$(jq -r '.role // "?"' "$run_dir/.agent_meta.json" 2>/dev/null || echo "?")
+
+  local alive="DEAD"
+  [ -n "$pane" ] && pane_alive "$pane" && alive="ALIVE"
+
+  local elapsed="?" timed_out="no"
+  if [ -f "$run_dir/.spawn_time" ]; then
+    local spawn_ts now_ts
+    spawn_ts=$(cat "$run_dir/.spawn_time")
+    now_ts=$(date +%s)
+    elapsed=$(( now_ts - spawn_ts ))
+    [ "$elapsed" -gt "$AGENT_TIMEOUT" ] && timed_out="YES"
+  fi
+
+  local done_status="no"
+  [ -f "$run_dir/.done_time" ] && done_status="YES"
+
+  echo "$run_id ($role): status=$alive elapsed=${elapsed}s timed_out=$timed_out done=$done_status pane=$pane"
+
+  [ "$alive" = "DEAD" ] && exit 2
+  [ "$timed_out" = "YES" ] && exit 3
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# retry — /new + resend
+# ---------------------------------------------------------------------------
+
+cmd_retry() {
+  local run_id="$1"
+  shift
+  local new_goal="${*:-}"
+
+  local run_dir
+  run_dir=$(get_run_dir "$SID" "$run_id")
+  [ ! -d "$run_dir" ] && { echo "ERROR: $run_id not found"; exit 1; }
+
+  local pane role goal
+  pane=$(cat "$run_dir/.pane_id" 2>/dev/null || echo "")
+  role=$(jq -r '.role // "?"' "$run_dir/.agent_meta.json" 2>/dev/null || echo "?")
+
+  [ -z "$pane" ] || ! pane_alive "$pane" && { echo "ERROR: $run_id pane dead, cannot retry"; exit 2; }
+
+  if [ -z "$new_goal" ]; then
+    goal=$(jq -r '.goal // ""' "$run_dir/.agent_meta.json" 2>/dev/null || echo "")
+    [ -z "$goal" ] && { echo "ERROR: No goal for $run_id"; exit 1; }
+  else
+    goal="$new_goal"
+    local tmp; tmp=$(mktemp)
+    jq --arg g "$goal" '.goal = $g' "$run_dir/.agent_meta.json" > "$tmp" 2>/dev/null && \
+      mv "$tmp" "$run_dir/.agent_meta.json" || rm -f "$tmp"
+  fi
+
+  # /new to reset conversation
+  tmux send-keys -t "$pane" -l "/new"
+  sleep 0.5
+  tmux send-keys -t "$pane" Enter
+  sleep 2
+
+  for _ in $(seq 1 20); do
+    local content
+    content=$(tmux capture-pane -t "$pane" -p -S -5 2>/dev/null || echo "")
+    if echo "$content" | grep -qE '(Ask anything|ctrl\+p commands|MCP /status)'; then
+      break
+    fi
+    sleep 1
+  done
+
+  # Reset timers
+  record_spawn_time "$run_dir"
+  rm -f "$run_dir/.done_time"
+
+  local task_prompt
+  task_prompt=$(build_task_prompt "$role" "$run_id" "$run_dir" "$goal")
+  send_task_to_pane "$pane" "$task_prompt"
+
+  log_event "$SESSION_DIR" "info" "retry $run_id ($role)"
+  echo "RETRIED $run_id $pane $role"
+}
+
+# ---------------------------------------------------------------------------
+# check-all — scan all agents, notify main of dead/timed-out
+# ---------------------------------------------------------------------------
+
+cmd_check_all() {
+  local problems=""
+  local count=0
+
+  for run_dir in "$SESSION_DIR"/runs/run-*; do
+    [ -d "$run_dir" ] || continue
+
+    local rid pane role
+    rid=$(basename "$run_dir")
+    pane=$(cat "$run_dir/.pane_id" 2>/dev/null || echo "")
+    role=$(jq -r '.role // "?"' "$run_dir/.agent_meta.json" 2>/dev/null || echo "?")
+
+    # Skip already done
+    [ -f "$run_dir/.done_time" ] && continue
+
+    local issue=""
+
+    # Dead pane check
+    if [ -n "$pane" ] && ! pane_alive "$pane"; then
+      issue="DEAD"
+    fi
+
+    # Timeout check
+    if [ -z "$issue" ] && [ -f "$run_dir/.spawn_time" ]; then
+      local spawn_ts now_ts elapsed
+      spawn_ts=$(cat "$run_dir/.spawn_time")
+      now_ts=$(date +%s)
+      elapsed=$(( now_ts - spawn_ts ))
+      if [ "$elapsed" -gt "$AGENT_TIMEOUT" ]; then
+        issue="TIMEOUT(${elapsed}s)"
+      fi
+    fi
+
+    if [ -n "$issue" ]; then
+      count=$((count + 1))
+      problems="$problems\n  $rid ($role): $issue"
+    fi
+  done
+
+  if [ "$count" -gt 0 ]; then
+    local alert="AGENT_ALERT: $count agent(s) have problems:$(printf '%b' "$problems")\nUse ./orc_agent ping <run_id> or ./orc_agent retry <run_id> to handle."
+
+    echo "$alert"
+
+    # Notify main agent
+    if [ -n "$MAIN_PANE" ] && pane_alive "$MAIN_PANE"; then
+      local short_alert="AGENT_ALERT: $count agent(s) need attention. Run: ./orc_agent list"
+      tmux send-keys -t "$MAIN_PANE" -l "$short_alert"
+      sleep 0.3
+      tmux send-keys -t "$MAIN_PANE" Enter
+      log_event "$SESSION_DIR" "warn" "check-all: $count problems, main agent notified"
+    fi
+  else
+    echo "All agents OK"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# list
+# ---------------------------------------------------------------------------
+
+cmd_list() {
+  echo "Session: $SID | Main: $MAIN_PANE | Timeout: ${AGENT_TIMEOUT}s"
+  echo ""
+  printf "  %-10s %-12s %-8s %-6s %-5s %-10s %s\n" "RUN" "ROLE" "POS" "ALIVE" "DONE" "ELAPSED" "PANE"
+  printf "  %s\n" "$(printf '%.0s─' {1..70})"
+
+  local has=false
+  for run_dir in "$SESSION_DIR"/runs/run-*; do
+    [ -d "$run_dir" ] || continue
+    has=true
+
+    local rid role pane col row alive="dead" pos elapsed_str="?" done_mark="no"
+    rid=$(basename "$run_dir")
+    role=$(jq -r '.role // "?"' "$run_dir/.agent_meta.json" 2>/dev/null || echo "?")
+    pane=$(jq -r '.pane_id // "?"' "$run_dir/.agent_meta.json" 2>/dev/null || echo "?")
+    col=$(jq -r '.col // -1' "$run_dir/.agent_meta.json" 2>/dev/null || echo "-1")
+    row=$(jq -r '.row // -1' "$run_dir/.agent_meta.json" 2>/dev/null || echo "-1")
+
+    [ "$col" = "-1" ] && pos="window" || pos="c${col}r${row}"
+    [ -f "$run_dir/.pane_id" ] && pane_alive "$(cat "$run_dir/.pane_id")" && alive="alive"
+    [ -f "$run_dir/.done_time" ] && done_mark="YES"
+
+    if [ -f "$run_dir/.spawn_time" ]; then
+      local st now_ts el
+      st=$(cat "$run_dir/.spawn_time"); now_ts=$(date +%s); el=$(( now_ts - st ))
+      [ "$el" -gt "$AGENT_TIMEOUT" ] && elapsed_str="${el}s!" || elapsed_str="${el}s"
+    fi
+
+    printf "  %-10s %-12s %-8s %-6s %-5s %-10s %s\n" "$rid" "$role" "$pos" "$alive" "$done_mark" "$elapsed_str" "$pane"
+  done
+
+  $has || echo "  No agents spawned yet."
+}
+
+# ---------------------------------------------------------------------------
+# help
+# ---------------------------------------------------------------------------
+
+cmd_help() {
+  cat <<'EOF'
+orc_agent — subagent orchestration
+
+SPAWN:
+  ./orc_agent spawn <role> "<goal>"             grid pane
+  ./orc_agent spawn-window <role> "<goal>"      separate window
+  Batch: ./orc_agent spawn explorer "a" && ./orc_agent spawn researcher "b"
+
+DONE (subagent reports result — file-safe):
+  ./orc_agent done <run_id> "<result summary>"
+
+REPLY (raw send to pane):
+  ./orc_agent reply <pane_id> "<message>"
+
+HEALTH:
+  ./orc_agent ping <run_id>       check alive + timeout (exit: 0=ok 2=dead 3=timeout)
+  ./orc_agent check-all           scan all, notify main of problems
+  ./orc_agent retry <run_id>      /new + resend same task
+  ./orc_agent retry <run_id> "better goal"
+
+LIST:
+  ./orc_agent list
+
+ROLES: researcher explorer reviewer summarizer verifier
+TIMEOUT: default 180s. ORC_AGENT_TIMEOUT=300 ./orc_agent spawn ...
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+[ $# -eq 0 ] && { cmd_help; exit 0; }
+
+CMD="$1"; shift
+
+case "$CMD" in
+  spawn)        [ $# -lt 2 ] && { echo "Usage: ./orc_agent spawn <role> <goal>" >&2; exit 1; };        cmd_spawn "$@" ;;
+  spawn-window) [ $# -lt 2 ] && { echo "Usage: ./orc_agent spawn-window <role> <goal>" >&2; exit 1; }; cmd_spawn_window "$@" ;;
+  done)         [ $# -lt 2 ] && { echo "Usage: ./orc_agent done <run_id> <summary>" >&2; exit 1; };    cmd_done "$@" ;;
+  reply)        [ $# -lt 2 ] && { echo "Usage: ./orc_agent reply <pane_id> <message>" >&2; exit 1; };  cmd_reply "$@" ;;
+  ping)         [ $# -lt 1 ] && { echo "Usage: ./orc_agent ping <run_id>" >&2; exit 1; };              cmd_ping "$1" ;;
+  retry)        [ $# -lt 1 ] && { echo "Usage: ./orc_agent retry <run_id> [goal]" >&2; exit 1; };      cmd_retry "$@" ;;
+  check-all)    cmd_check_all ;;
+  list|ls)      cmd_list ;;
+  help|-h|--help) cmd_help ;;
+  *)            echo "Unknown: $CMD" >&2; exit 1 ;;
+esac
