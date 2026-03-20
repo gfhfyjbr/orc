@@ -4,8 +4,9 @@
 # =============================================================================
 #
 # COMMANDS:
-#   ./orc_agent spawn <role> <goal>           # grid pane
+#   ./orc_agent spawn <role> <goal>           # grid pane (auto-reuses done panes!)
 #   ./orc_agent spawn-window <role> <goal>    # separate window fallback
+#   ./orc_agent reassign [run_id] <role> <goal> # reuse done pane with new role+task
 #   ./orc_agent done <run_id> <summary>       # subagent reports completion (file-safe)
 #   ./orc_agent reply <pane_id> <message>     # raw send to any pane
 #   ./orc_agent ping <run_id>                 # alive + timeout check
@@ -21,7 +22,8 @@ ORC_DIR=".orchestrator"
 
 source "$SCRIPT_DIR/lib.sh"
 
-MAX_PER_COLUMN=4
+MAX_PER_COLUMN=2
+MAX_GRID_CELLS=6   # 3 columns × 2 rows
 MIN_PANE_HEIGHT=12
 MIN_PANE_WIDTH=55
 AGENT_TIMEOUT="${ORC_AGENT_TIMEOUT:-180}"
@@ -45,7 +47,9 @@ resolve_current_session() {
 SID=$(resolve_current_session)
 SESSION_DIR=$(get_session_dir "$SID")
 SESSION_NAME=$(resolve_session_name "$SID")
-WORKDIR=$(jq -r '.workdir // "."' "$SESSION_DIR/session.json" 2>/dev/null || pwd)
+# Use worktree_path if available (session isolation), fall back to workdir
+WORKDIR=$(jq -r '.worktree_path // .workdir // "."' "$SESSION_DIR/session.json" 2>/dev/null || pwd)
+PROJECT_ROOT=$(jq -r '.workdir // "."' "$SESSION_DIR/session.json" 2>/dev/null || pwd)
 
 MAIN_PANE=""
 [ -f "$SESSION_DIR/.main_pane_id" ] && MAIN_PANE=$(cat "$SESSION_DIR/.main_pane_id")
@@ -56,6 +60,27 @@ LAYOUT_FILE="$SESSION_DIR/.layout_panes"
 TMPL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/templates"
 
 # ---------------------------------------------------------------------------
+# Disk space guard — refuse to spawn if disk is critically low
+# ---------------------------------------------------------------------------
+
+MIN_DISK_KB=102400  # 100MB minimum
+
+check_disk_space() {
+  local avail_kb
+  avail_kb=$(df -k . 2>/dev/null | awk 'NR==2{print $4}')
+  if [ -z "$avail_kb" ] || [ "$avail_kb" = "0" ]; then
+    log_event "$SESSION_DIR" "warn" "Cannot determine disk space — proceeding with caution"
+    return 0  # optimistic: allow spawn if df fails
+  fi
+  if [ "$avail_kb" -lt "$MIN_DISK_KB" ]; then
+    log_event "$SESSION_DIR" "error" "DISK_FULL: Only ${avail_kb}KB available (<${MIN_DISK_KB}KB min) — refusing spawn"
+    echo "ERROR: Disk space critically low (${avail_kb}KB < ${MIN_DISK_KB}KB). Cannot spawn agent." >&2
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # reply — raw tmux send-keys (short messages only!)
 # ---------------------------------------------------------------------------
 
@@ -64,9 +89,16 @@ cmd_reply() {
   shift
   local message="$*"
   message=$(printf '%s' "$message" | tr -d '\033')
-  tmux send-keys -t "$target_pane" -l "$message"
-  sleep 0.5
-  tmux send-keys -t "$target_pane" Enter
+
+  local sendkeys_lock="$SESSION_DIR/.sendkeys_lock"
+  if acquire_lock "$sendkeys_lock" 15; then
+    tmux send-keys -t "$target_pane" -l "$message"
+    sleep 0.5
+    tmux send-keys -t "$target_pane" Enter
+    release_lock "$sendkeys_lock"
+  else
+    log_event "$SESSION_DIR" "warn" "send-keys lock timeout for reply to $target_pane"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -88,6 +120,23 @@ cmd_done() {
   # Mark done
   date +%s > "$run_dir/.done_time"
 
+  # FIX C: Clean up .claimed markers for the pane this run used.
+  # This allows the pane to be reused by future spawns.
+  local done_pane
+  done_pane=$(cat "$run_dir/.pane_id" 2>/dev/null || echo "")
+  if [ -n "$done_pane" ]; then
+    for claim_candidate in "$SESSION_DIR"/runs/run-*/.claimed; do
+      [ -d "$claim_candidate" ] || continue
+      local claim_run_dir
+      claim_run_dir=$(dirname "$claim_candidate")
+      local claim_pane
+      claim_pane=$(cat "$claim_run_dir/.pane_id" 2>/dev/null || echo "")
+      if [ "$claim_pane" = "$done_pane" ]; then
+        rm -rf "$claim_candidate" 2>/dev/null || true
+      fi
+    done
+  fi
+
   # Send SHORT safe notification to main pane (no special chars issues)
   # Truncate to 200 chars for send-keys safety
   local short
@@ -101,9 +150,42 @@ cmd_done() {
   fi
 
   if [ -n "$MAIN_PANE" ] && pane_alive "$MAIN_PANE"; then
-    tmux send-keys -t "$MAIN_PANE" -l "$notify"
-    sleep 0.5
-    tmux send-keys -t "$MAIN_PANE" Enter
+    local sendkeys_lock="$SESSION_DIR/.sendkeys_lock"
+    local _lock_acquired=false
+    if acquire_lock "$sendkeys_lock" 15; then
+      _lock_acquired=true
+    else
+      # Retry once after 2s wait
+      log_event "$SESSION_DIR" "warn" "send-keys lock timeout for done $run_id — retrying in 2s"
+      sleep 2
+      if acquire_lock "$sendkeys_lock" 15; then
+        _lock_acquired=true
+      else
+        log_event "$SESSION_DIR" "warn" "send-keys lock RETRY failed for done $run_id — notification lost"
+        printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$run_id" >> "$SESSION_DIR/.lost_notifications"
+      fi
+    fi
+    if $_lock_acquired; then
+      tmux send-keys -t "$MAIN_PANE" -l "$notify"
+      sleep 0.5
+      tmux send-keys -t "$MAIN_PANE" Enter
+      release_lock "$sendkeys_lock"
+    fi
+  fi
+
+  # Auto-commit for coder role: if this agent was a coder and there are changes, commit them
+  local agent_role=""
+  agent_role=$(jq -r '.role // ""' "$run_dir/.agent_meta.json" 2>/dev/null || echo "")
+  if [ "$agent_role" = "coder" ]; then
+    local agent_goal=""
+    agent_goal=$(jq -r '.goal // ""' "$run_dir/.agent_meta.json" 2>/dev/null || echo "")
+    # Truncate goal to 80 chars for commit message
+    local short_goal
+    short_goal=$(printf '%.80s' "$agent_goal")
+    local commit_msg="orc: [coder] $short_goal"
+    if session_commit "$WORKDIR" "$commit_msg" 2>/dev/null; then
+      log_event "$SESSION_DIR" "info" "auto-committed changes from $run_id (coder)"
+    fi
   fi
 
   log_event "$SESSION_DIR" "info" "done $run_id"
@@ -114,48 +196,106 @@ cmd_done() {
 # Layout helpers
 # ---------------------------------------------------------------------------
 
+# Remove dead pane IDs from LAYOUT_FILE, keeping it in sync with tmux reality.
+# Must be called before any calculation that depends on LAYOUT_FILE contents.
+cleanup_layout_file() {
+  [ ! -f "$LAYOUT_FILE" ] && return
+  local temp_file="${LAYOUT_FILE}.tmp.$$"
+  : > "$temp_file"
+  while IFS= read -r pane_id; do
+    [ -z "$pane_id" ] && continue
+    if pane_alive "$pane_id"; then
+      echo "$pane_id" >> "$temp_file"
+    fi
+  done < "$LAYOUT_FILE"
+  mv "$temp_file" "$LAYOUT_FILE"
+}
+
 equalize_layout() {
+  # Purge dead panes first so calculations reflect reality
+  cleanup_layout_file
+
   local total
   total=$(wc -l < "$LAYOUT_FILE" | tr -d ' ')
   [ "$total" -eq 0 ] && return
 
+  # Grid: up to 3 columns × 2 rows = 6 cells max
+  # Layout mapping (MAX_PER_COLUMN=2):
+  #   1 agent  → col0(1 row)
+  #   2 agents → col0(2 rows)
+  #   3 agents → col0(2 rows) + col1(1 row)
+  #   4 agents → col0(2 rows) + col1(2 rows)
+  #   5 agents → col0(2 rows) + col1(2 rows) + col2(1 row)
+  #   6 agents → col0(2 rows) + col1(2 rows) + col2(2 rows)
   local num_cols=$(( (total - 1) / MAX_PER_COLUMN + 1 ))
   local win_width win_height
   win_width=$(tmux display-message -t "$SESSION_NAME" -p '#{window_width}' 2>/dev/null || echo 200)
   win_height=$(tmux display-message -t "$SESSION_NAME" -p '#{window_height}' 2>/dev/null || echo 50)
 
+  # Main pane: 25% width, minimum 40
   local main_width=$((win_width * 25 / 100))
   [ "$main_width" -lt 40 ] && main_width=40
+
+  # Separators: 1 between main and agent area + (num_cols-1) between agent cols = num_cols
+  local agent_width=$(( (win_width - main_width - num_cols) / num_cols ))
+
+  # Resize MAIN pane first — establishes the agent area
   tmux resize-pane -t "$MAIN_PANE" -x "$main_width" 2>/dev/null || true
 
-  local agent_width=$(( (win_width - main_width - 1) / num_cols ))
-  local line=1
-  while [ "$line" -le "$total" ]; do
-    local col=$(( (line - 1) / MAX_PER_COLUMN ))
+  # Resize agent columns LEFT→RIGHT, skip the LAST column (it auto-fills remaining space).
+  local col=0
+  while [ "$col" -lt "$num_cols" ]; do
     local col_start=$(( col * MAX_PER_COLUMN + 1 ))
     local col_end=$(( (col + 1) * MAX_PER_COLUMN ))
     [ "$col_end" -gt "$total" ] && col_end="$total"
     local agents_in_col=$(( col_end - col_start + 1 ))
-    local row_height=$(( (win_height - 1) / agents_in_col ))
 
+    # Row height accounts for separators between rows: (agents_in_col - 1) separators
+    local row_height=$(( (win_height - agents_in_col + 1) / agents_in_col ))
+
+    # Set column width via first pane — skip last column so it fills remaining space
+    if [ "$col" -lt $((num_cols - 1)) ]; then
+      local first_pane
+      first_pane=$(sed -n "${col_start}p" "$LAYOUT_FILE")
+      if [ -n "$first_pane" ]; then
+        tmux resize-pane -t "$first_pane" -x "$agent_width" 2>/dev/null || true
+      fi
+    fi
+
+    # Set row heights — skip last row so it fills remaining height
     local row="$col_start"
-    while [ "$row" -le "$col_end" ]; do
+    while [ "$row" -lt "$col_end" ]; do
       local pane
       pane=$(sed -n "${row}p" "$LAYOUT_FILE")
-      [ -z "$pane" ] && { row=$((row + 1)); continue; }
-      tmux resize-pane -t "$pane" -y "$row_height" 2>/dev/null || true
-      [ "$row" -eq "$col_start" ] && tmux resize-pane -t "$pane" -x "$agent_width" 2>/dev/null || true
+      if [ -n "$pane" ]; then
+        tmux resize-pane -t "$pane" -y "$row_height" 2>/dev/null || true
+      fi
       row=$((row + 1))
     done
-    line=$((col_end + 1))
+
+    col=$((col + 1))
   done
+
+  # Force tmux to re-render layout (prevents stale pane dimensions after split)
+  tmux select-layout -t "$SESSION_NAME" -E 2>/dev/null || true
 }
 
 check_viewport() {
+  # Clean up dead panes so we base the decision on real pane count
+  cleanup_layout_file
+
   local total
   total=$(wc -l < "$LAYOUT_FILE" | tr -d ' ')
-  local num_cols_needed=$(( total / MAX_PER_COLUMN + 1 ))
-  local rows_in_target_col=$(( total % MAX_PER_COLUMN + 1 ))
+
+  # Hard limit: max 6 cells in grid (3 cols × 2 rows)
+  if [ "$total" -ge "$MAX_GRID_CELLS" ]; then
+    return 1
+  fi
+
+  # Calculate layout after adding one more pane
+  local future_total=$((total + 1))
+  local num_cols_needed=$(( (future_total - 1) / MAX_PER_COLUMN + 1 ))
+  local rows_in_target_col=$(( future_total - (num_cols_needed - 1) * MAX_PER_COLUMN ))
 
   local win_width win_height
   win_width=$(tmux display-message -t "$SESSION_NAME" -p '#{window_width}' 2>/dev/null || echo 200)
@@ -164,8 +304,10 @@ check_viewport() {
   local main_width=$((win_width * 25 / 100))
   [ "$main_width" -lt 40 ] && main_width=40
 
-  local agent_width=$(( (win_width - main_width) / num_cols_needed ))
-  local row_height=$(( win_height / rows_in_target_col ))
+  # Account for all pane separators: num_cols_needed between main+agent columns
+  local agent_width=$(( (win_width - main_width - num_cols_needed) / num_cols_needed ))
+  # Row separators within column: (rows_in_target_col - 1)
+  local row_height=$(( (win_height - rows_in_target_col + 1) / rows_in_target_col ))
   [ "$agent_width" -ge "$MIN_PANE_WIDTH" ] && [ "$row_height" -ge "$MIN_PANE_HEIGHT" ]
 }
 
@@ -203,51 +345,136 @@ build_task_prompt() {
   local run_dir="$3"
   local goal="$4"
 
+  # FIX #7: Validate MAIN_PANE before building prompt
+  if [ -z "$MAIN_PANE" ]; then
+    log_event "$SESSION_DIR" "error" "MAIN_PANE is empty for $run_id"
+    echo "ERROR: MAIN_PANE not set" >&2
+    return 1
+  fi
+
   local role_profile=""
   [ -f "$TMPL_DIR/specs/${role}.md" ] && role_profile=$(cat "$TMPL_DIR/specs/${role}.md")
 
+  local generic_prompt=""
+  [ -f "$TMPL_DIR/prompts/subagent-generic.md" ] && generic_prompt=$(cat "$TMPL_DIR/prompts/subagent-generic.md")
+
   local role_prompt=""
   [ -f "$TMPL_DIR/prompts/subagent-${role}.md" ] && role_prompt=$(cat "$TMPL_DIR/prompts/subagent-${role}.md")
+  # Prepend generic subagent instructions before role-specific ones
+  if [ -n "$generic_prompt" ]; then
+    role_prompt="${generic_prompt}
+${role_prompt}"
+  fi
 
-  cat <<EOF
-You are a $role subagent ($run_id).
+  # FIX #34: Auto-detect project context from WORKDIR
+  local project_context=""
+  if [ -f "$WORKDIR/Cargo.toml" ]; then
+    project_context="- Language: Rust
+- Build: \`cargo build\`
+- Test: \`cargo test\`
+- Config: Cargo.toml"
+  elif [ -f "$WORKDIR/package.json" ]; then
+    project_context="- Language: Node.js
+- Build: \`npm run build\`
+- Test: \`npm test\`
+- Config: package.json"
+  elif [ -f "$WORKDIR/go.mod" ]; then
+    project_context="- Language: Go
+- Build: \`go build ./...\`
+- Test: \`go test ./...\`
+- Config: go.mod"
+  elif [ -f "$WORKDIR/pyproject.toml" ]; then
+    project_context="- Language: Python
+- Test: \`pytest\`
+- Config: pyproject.toml"
+  elif [ -f "$WORKDIR/setup.py" ]; then
+    project_context="- Language: Python
+- Test: \`pytest\`
+- Config: setup.py"
+  elif [ -f "$WORKDIR/Makefile" ]; then
+    project_context="- Build: \`make\`
+- Test: \`make test\`
+- Config: Makefile"
+  fi
+
+  # Build scope constraints based on role
+  local scope_constraints
+  if [ "$role" = "coder" ]; then
+    scope_constraints="- You ARE allowed to modify source files — this is your primary job. But ONLY within the scope of the task above.
+- Verify your changes compile/build. Run tests if available."
+  else
+    scope_constraints="- Do NOT modify files unless your role explicitly requires it (coder is the only role that modifies source files)."
+  fi
+
+  # FIX #3: Use quoted heredoc to prevent shell expansion of goal text.
+  # Variables are interpolated via placeholder replacement AFTER the heredoc.
+  local prompt_text
+  prompt_text=$(cat <<'PROMPT_EOF'
+You are a ___ROLE___ subagent (___RUN_ID___).
 
 ## ROLE PROFILE
-$role_profile
+___ROLE_PROFILE___
 
 ## ROLE-SPECIFIC INSTRUCTIONS
-$role_prompt
+___ROLE_PROMPT___
+
+___PROJECT_CONTEXT_SECTION___
 
 ## YOUR TASK
-$goal
+```goal
+___GOAL___
+```
 
 ## SCOPE CONSTRAINTS
-- You are ONLY a $role. Do NOT do work outside this role.
-- Do NOT modify files unless your role explicitly requires it (only reviewer/verifier may suggest changes, explorer NEVER modifies).
+- You are ONLY a ___ROLE___. Do NOT do work outside this role.
+___SCOPE_CONSTRAINTS___
 - Do NOT answer the end user. Your output is for the main orchestrator agent only.
 - Stay strictly within the task scope above.
+- You MUST NOT call ./orc_agent spawn, ./orc_agent spawn-window, or ./orc_agent reassign. These commands are ONLY for the orchestrator. You may ONLY use: ./orc_agent done <run_id> and ./orc_agent reply <pane_id>.
 
 ## STEP 1: ACKNOWLEDGE (do this FIRST)
 Immediately run this bash command to confirm you received the task:
-\`\`\`bash
-./orc_agent reply $MAIN_PANE "$run_id: ACK — starting $role task"
-\`\`\`
+```bash
+./orc_agent reply ___MAIN_PANE___ "___RUN_ID___: ACK — starting ___ROLE___ task"
+```
 
 ## STEP 2: DO THE WORK
 Execute the task within scope.
 
 ## STEP 3: REPORT RESULT
 When done, run this bash command to send your result:
-\`\`\`bash
-./orc_agent done $run_id "Your concise result here. Key findings, conclusions, recommendations."
-\`\`\`
+```bash
+./orc_agent done ___RUN_ID___ "Your concise result here. Key findings, conclusions, recommendations."
+```
 
 This safely writes your result to a file and notifies the main agent.
-If you need to include detailed/structured output, also write to \`$run_dir/handoff.md\` before calling done.
+If you need to include detailed/structured output, also write to `___RUN_DIR___/handoff.md` before calling done.
 
 ## TIMEOUT
-You have ${AGENT_TIMEOUT}s. Work efficiently. ACK immediately, then work, then report.
-EOF
+You have ___AGENT_TIMEOUT___s. Work efficiently. ACK immediately, then work, then report.
+PROMPT_EOF
+  )
+
+  # Build project context section (only if detected)
+  local project_context_section=""
+  if [ -n "$project_context" ]; then
+    project_context_section="## PROJECT CONTEXT
+${project_context}"
+  fi
+
+  # Replace placeholders with actual values (safe — no shell expansion of goal)
+  prompt_text="${prompt_text//___ROLE_PROFILE___/$role_profile}"
+  prompt_text="${prompt_text//___ROLE_PROMPT___/$role_prompt}"
+  prompt_text="${prompt_text//___GOAL___/$goal}"
+  prompt_text="${prompt_text//___SCOPE_CONSTRAINTS___/$scope_constraints}"
+  prompt_text="${prompt_text//___PROJECT_CONTEXT_SECTION___/$project_context_section}"
+  prompt_text="${prompt_text//___MAIN_PANE___/$MAIN_PANE}"
+  prompt_text="${prompt_text//___RUN_DIR___/$run_dir}"
+  prompt_text="${prompt_text//___AGENT_TIMEOUT___/$AGENT_TIMEOUT}"
+  prompt_text="${prompt_text//___RUN_ID___/$run_id}"
+  prompt_text="${prompt_text//___ROLE___/$role}"
+
+  printf '%s' "$prompt_text"
 }
 
 # ---------------------------------------------------------------------------
@@ -258,7 +485,7 @@ start_opencode_in_pane() {
   local pane="$1"
   local run_dir="$2"
 
-  tmux send-keys -t "$pane" "cd $WORKDIR && opencode" Enter
+  tmux send-keys -t "$pane" "export ORC_IS_SUBAGENT=1 && cd $WORKDIR && opencode" Enter
   tmux pipe-pane -t "$pane" -o "cat >> $run_dir/transcript.log"
   tmux select-pane -t "$MAIN_PANE" 2>/dev/null || true
 
@@ -277,8 +504,24 @@ start_opencode_in_pane() {
 send_task_to_pane() {
   local pane="$1"
   local prompt="$2"
-  tmux send-keys -t "$pane" -l "$prompt"
-  sleep 0.5
+  # FIX #4: Strip control characters (except newline \012 and tab \011) to prevent
+  # malformed tmux send-keys input from goal text containing binary/control chars.
+  local clean_prompt
+  clean_prompt=$(printf '%s' "$prompt" | tr -d '\000-\010\013\014\016-\037')
+
+  # FIX: Wait for pane to be in input-ready state before sending prompt.
+  # Prevents createUserMessage schema validation failure (OpenCode #17387, #4776).
+  for _ in $(seq 1 5); do
+    local content
+    content=$(tmux capture-pane -t "$pane" -p -S -3 2>/dev/null || echo "")
+    if echo "$content" | grep -qE '(Ask anything|ctrl\+p)'; then
+      break
+    fi
+    sleep 1
+  done
+
+  tmux send-keys -t "$pane" -l "$clean_prompt"
+  sleep 1.5
   tmux send-keys -t "$pane" Enter
 }
 
@@ -287,22 +530,196 @@ record_spawn_time() {
 }
 
 # ---------------------------------------------------------------------------
+# Pane reuse helpers
+# ---------------------------------------------------------------------------
+
+# Find a reusable pane from completed agents (done + pane alive)
+# Uses atomic mkdir to claim, preventing two spawns from grabbing the same pane.
+# Prints run_dir of first reusable agent; returns 1 if none found
+find_reusable_pane() {
+  for run_dir in "$SESSION_DIR"/runs/run-*; do
+    [ -d "$run_dir" ] || continue
+    # Must be done
+    [ -f "$run_dir/.done_time" ] || continue
+    # Must have pane_id
+    [ -f "$run_dir/.pane_id" ] || continue
+    local pane
+    pane=$(cat "$run_dir/.pane_id")
+    # Pane must be alive
+    if pane_alive "$pane"; then
+      # FIX B: Check no active (non-done) run occupies this pane via reassign
+      local occupied=false
+      for other_run in "$SESSION_DIR"/runs/run-*; do
+        [ "$other_run" = "$run_dir" ] && continue
+        [ -d "$other_run" ] || continue
+        local other_pane
+        other_pane=$(cat "$other_run/.pane_id" 2>/dev/null) || continue
+        [ "$other_pane" != "$pane" ] && continue
+        # Same pane — check if this other run is still active
+        if [ ! -f "$other_run/.done_time" ] && [ ! -f "$other_run/DONE" ] && [ ! -f "$other_run/FAILED" ]; then
+          occupied=true
+          break
+        fi
+      done
+      if $occupied; then continue; fi
+
+      # Atomic claim: mkdir is atomic on POSIX — prevents double-claim
+      local claim_dir="$run_dir/.claimed"
+      if mkdir "$claim_dir" 2>/dev/null; then
+        echo "$run_dir"
+        return 0
+      fi
+      # Another process claimed this pane — check if stale (>60s) and reclaim
+      if [ -d "$claim_dir" ]; then
+        local claim_age=0
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+          claim_age=$(( $(date +%s) - $(stat -f %m "$claim_dir" 2>/dev/null || echo "$(date +%s)") ))
+        else
+          claim_age=$(( $(date +%s) - $(stat -c %Y "$claim_dir" 2>/dev/null || echo "$(date +%s)") ))
+        fi
+        if [ "$claim_age" -gt 60 ]; then
+          rm -rf "$claim_dir" 2>/dev/null || true
+          if mkdir "$claim_dir" 2>/dev/null; then
+            echo "$run_dir"
+            return 0
+          fi
+        fi
+      fi
+      continue
+    fi
+  done
+  return 1
+}
+
+# Core reuse logic — /new + assign new role/task on existing pane
+# Usage: reuse_pane_for_task <old_run_dir> <role> <goal>
+reuse_pane_for_task() {
+  local old_run_dir="$1"
+  local role="$2"
+  local goal="$3"
+
+  local old_pane old_run_id
+  old_pane=$(cat "$old_run_dir/.pane_id")
+  old_run_id=$(basename "$old_run_dir")
+
+  # Create new run
+  local run_id run_dir
+  run_id=$(generate_run_id "$SESSION_DIR")
+  run_dir=$(get_run_dir "$SID" "$run_id")
+  mkdir -p "$run_dir"
+
+  # Copy pane reference to new run
+  echo "$old_pane" > "$run_dir/.pane_id"
+
+  # Inherit grid position from old run
+  local old_col old_row
+  old_col=$(jq -r '.col // -1' "$old_run_dir/.agent_meta.json" 2>/dev/null || echo "-1")
+  old_row=$(jq -r '.row // -1' "$old_run_dir/.agent_meta.json" 2>/dev/null || echo "-1")
+
+  jq -n \
+    --arg run_id "$run_id" \
+    --arg role "$role" \
+    --arg pane_id "$old_pane" \
+    --arg goal "$goal" \
+    --argjson col "${old_col}" \
+    --argjson row "${old_row}" \
+    --arg spawned_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg reused_from "$old_run_id" \
+    '{run_id:$run_id,role:$role,pane_id:$pane_id,goal:$goal,col:$col,row:$row,spawned_at:$spawned_at,reused_from:$reused_from}' \
+    > "$run_dir/.agent_meta.json"
+
+  # /new to reset OpenCode conversation
+  tmux send-keys -t "$old_pane" -l "/new"
+  sleep 0.5
+  tmux send-keys -t "$old_pane" Enter
+  sleep 2
+
+  # Wait for OpenCode readiness after /new
+  for _ in $(seq 1 20); do
+    local content
+    content=$(tmux capture-pane -t "$old_pane" -p -S -5 2>/dev/null || echo "")
+    if echo "$content" | grep -qE '(Ask anything|ctrl\+p commands|MCP /status)'; then
+      break
+    fi
+    sleep 1
+  done
+
+  # Extra settle time after /new — prevents empty-message race (OpenCode #17387)
+  sleep 2
+
+  # Setup transcript logging for new run
+  tmux pipe-pane -t "$old_pane" -o "cat >> $run_dir/transcript.log"
+
+  # Reset timers
+  record_spawn_time "$run_dir"
+
+  # Re-equalize grid — pane count or window size may have changed since last layout
+  equalize_layout
+
+  # Build and send new task prompt with new role
+  local task_prompt
+  task_prompt=$(build_task_prompt "$role" "$run_id" "$run_dir" "$goal")
+  send_task_to_pane "$old_pane" "$task_prompt"
+
+  # FIX C: Do NOT remove .claimed here — keep it until the NEW run is done.
+  # This prevents another spawn from re-claiming the same pane before this run finishes.
+  # Cleanup happens in cmd_done instead.
+
+  log_event "$SESSION_DIR" "info" "reassigned $run_id ($role) reused=$old_run_id pane=$old_pane"
+  echo "REASSIGNED $run_id $old_pane $role (reused from $old_run_id, timeout:${AGENT_TIMEOUT}s)"
+}
+
+# ---------------------------------------------------------------------------
 # spawn — grid layout
 # ---------------------------------------------------------------------------
 
 cmd_spawn() {
+  # Guard: subagents cannot spawn other agents
+  if [ "${ORC_IS_SUBAGENT:-}" = "1" ]; then
+    echo "ERROR: Subagents cannot spawn other agents. Use orc_agent done to return results." >&2
+    exit 1
+  fi
+
   local role="$1"
   shift
   local goal="$*"
 
+  check_disk_space || exit 1
+
   case "$role" in
-    researcher|explorer|reviewer|summarizer|verifier) ;;
+    researcher|explorer|reviewer|summarizer|verifier|coder) ;;
     *) echo "ERROR: Invalid role '$role'" >&2; exit 1 ;;
   esac
 
+  # Auto-reuse a completed agent's pane if available (faster, saves viewport)
+  if [ "${ORC_NO_REUSE:-}" != "1" ]; then
+    local reusable_dir=""
+    reusable_dir=$(find_reusable_pane 2>/dev/null) || true
+    if [ -n "$reusable_dir" ]; then
+      reuse_pane_for_task "$reusable_dir" "$role" "$goal"
+      exit 0
+    fi
+  fi
+
+  # --- LOCK: atomic read-check-split-write to prevent race conditions ---
+  # Without this lock, parallel spawns can read the same pane count and
+  # all try to split the same target, producing duplicate pane IDs.
+  local layout_lock="$SESSION_DIR/.layout_lock"
+  if ! acquire_lock "$layout_lock" 15; then
+    log_event "$SESSION_DIR" "error" "layout lock timeout for spawn — aborting"
+    echo "SPAWN_ERROR: layout lock timeout" >&2
+    exit 1
+  fi
+  # Ensure lock is released on any exit from this point
+  trap 'release_lock "$layout_lock"' EXIT
+
   if ! check_viewport; then
-    echo "VIEWPORT_FULL: Not enough space. Use: ./orc_agent spawn-window $role \"$goal\""
-    exit 2
+    release_lock "$layout_lock"
+    trap - EXIT
+    # Fallback: grid full (>= MAX_GRID_CELLS) → use spawn-window automatically
+    log_event "$SESSION_DIR" "info" "grid full ($MAX_GRID_CELLS cells) — falling back to spawn-window for $role"
+    cmd_spawn_window "$role" "$goal"
+    exit $?
   fi
 
   local run_id
@@ -316,29 +733,55 @@ cmd_spawn() {
   local target_col=$(( total / MAX_PER_COLUMN ))
   local target_row=$(( total % MAX_PER_COLUMN ))
 
+  # Grid split logic for 3 cols × 2 rows (MAX_PER_COLUMN=2):
+  #   total=0 → horizontal split from main (first column, first row)
+  #   total=1 → vertical split of col0 pane (col0 gets 2nd row)
+  #   total=2 → new column: full-height horizontal split from col0 top pane
+  #   total=3 → vertical split of col1 pane (col1 gets 2nd row)
+  #   total=4 → new column: full-height horizontal split from col1 top pane
+  #   total=5 → vertical split of col2 pane (col2 gets 2nd row)
   local new_pane=""
   if [ "$total" -eq 0 ]; then
+    # First agent: horizontal split right of main pane
     new_pane=$(create_pane_split "-h" "$MAIN_PANE" "75%")
   elif [ "$target_row" -eq 0 ]; then
+    # New column: full-height horizontal split from previous column's top pane
     local prev_first_line=$(( (target_col - 1) * MAX_PER_COLUMN + 1 ))
     local prev_first_pane
     prev_first_pane=$(sed -n "${prev_first_line}p" "$LAYOUT_FILE")
     new_pane=$(create_pane_split "-fh" "$prev_first_pane")
   else
+    # Second row in current column: vertical split of the last pane
     local last_pane
     last_pane=$(sed -n "${total}p" "$LAYOUT_FILE")
     new_pane=$(create_pane_split "-v" "$last_pane")
   fi
 
   if [ -z "$new_pane" ]; then
+    release_lock "$layout_lock"
+    trap - EXIT
     echo "SPAWN_ERROR: split-window failed" >&2
     exit 1
   fi
 
+  # Atomic write: register pane in layout file while still holding lock
   echo "$new_pane" >> "$LAYOUT_FILE"
+
+  # Release lock — layout file is now consistent for other parallel spawns
+  release_lock "$layout_lock"
+  trap - EXIT
+  # --- END LOCK ---
+
   echo "$new_pane" > "$run_dir/.pane_id"
-  printf '{"run_id":"%s","role":"%s","pane_id":"%s","goal":"%s","col":%d,"row":%d,"spawned_at":"%s"}\n' \
-    "$run_id" "$role" "$new_pane" "$(echo "$goal" | tr '"' "'")" "$target_col" "$target_row" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  jq -n \
+    --arg run_id "$run_id" \
+    --arg role "$role" \
+    --arg pane_id "$new_pane" \
+    --arg goal "$goal" \
+    --argjson col "$target_col" \
+    --argjson row "$target_row" \
+    --arg spawned_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{run_id:$run_id,role:$role,pane_id:$pane_id,goal:$goal,col:$col,row:$row,spawned_at:$spawned_at}' \
     > "$run_dir/.agent_meta.json"
 
   equalize_layout
@@ -348,6 +791,9 @@ cmd_spawn() {
     echo "SPAWN_ERROR $run_id $new_pane $role — OpenCode not ready"
     exit 1
   fi
+
+  # Extra settle time after OpenCode startup — protects against #17387 createUserMessage race
+  sleep 2
 
   local task_prompt
   task_prompt=$(build_task_prompt "$role" "$run_id" "$run_dir" "$goal")
@@ -362,12 +808,20 @@ cmd_spawn() {
 # ---------------------------------------------------------------------------
 
 cmd_spawn_window() {
+  # Guard: subagents cannot spawn other agents
+  if [ "${ORC_IS_SUBAGENT:-}" = "1" ]; then
+    echo "ERROR: Subagents cannot spawn other agents. Use orc_agent done to return results." >&2
+    exit 1
+  fi
+
   local role="$1"
   shift
   local goal="$*"
 
+  check_disk_space || exit 1
+
   case "$role" in
-    researcher|explorer|reviewer|summarizer|verifier) ;;
+    researcher|explorer|reviewer|summarizer|verifier|coder) ;;
     *) echo "ERROR: Invalid role '$role'" >&2; exit 1 ;;
   esac
 
@@ -383,8 +837,16 @@ cmd_spawn_window() {
   new_pane=$(tmux list-panes -t "$SESSION_NAME:$win_name" -F '#{pane_id}' | head -1)
 
   echo "$new_pane" > "$run_dir/.pane_id"
-  printf '{"run_id":"%s","role":"%s","pane_id":"%s","window":"%s","goal":"%s","col":-1,"row":-1,"spawned_at":"%s"}\n' \
-    "$run_id" "$role" "$new_pane" "$win_name" "$(echo "$goal" | tr '"' "'")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  jq -n \
+    --arg run_id "$run_id" \
+    --arg role "$role" \
+    --arg pane_id "$new_pane" \
+    --arg window "$win_name" \
+    --arg goal "$goal" \
+    --argjson col -1 \
+    --argjson row -1 \
+    --arg spawned_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{run_id:$run_id,role:$role,pane_id:$pane_id,window:$window,goal:$goal,col:$col,row:$row,spawned_at:$spawned_at}' \
     > "$run_dir/.agent_meta.json"
 
   record_spawn_time "$run_dir"
@@ -401,6 +863,67 @@ cmd_spawn_window() {
 
   log_event "$SESSION_DIR" "info" "spawned $run_id ($role) window=$win_name"
   echo "SPAWNED $run_id $new_pane $role (window: $win_name)"
+}
+
+# ---------------------------------------------------------------------------
+# reassign — reuse a completed agent's pane with new role + task
+# ---------------------------------------------------------------------------
+
+cmd_reassign() {
+  # Guard: subagents cannot spawn other agents
+  if [ "${ORC_IS_SUBAGENT:-}" = "1" ]; then
+    echo "ERROR: Subagents cannot spawn or reassign agents. Use orc_agent done to return results." >&2
+    exit 1
+  fi
+
+  check_disk_space || exit 1
+
+  local old_run_dir=""
+
+  # Parse: reassign [old_run_id] <role> <goal>
+  # If first arg looks like run-NNN, use that specific completed agent
+  # Otherwise, auto-find first available reusable pane
+  if [[ "$1" == run-* ]]; then
+    local old_run_id="$1"; shift
+    old_run_dir=$(get_run_dir "$SID" "$old_run_id")
+    [ ! -d "$old_run_dir" ] && { echo "ERROR: $old_run_id not found"; exit 1; }
+  fi
+
+  local role="$1"; shift
+  local goal="$*"
+
+  # Validate role
+  case "$role" in
+    researcher|explorer|reviewer|summarizer|verifier|coder) ;;
+    *) echo "ERROR: Invalid role '$role'" >&2; exit 1 ;;
+  esac
+
+  # Auto-find reusable pane if no specific run_id given
+  if [ -z "$old_run_dir" ]; then
+    old_run_dir=$(find_reusable_pane) || {
+      echo "NO_REUSABLE: No done agents with alive panes. Use: ./orc_agent spawn $role \"$goal\""
+      exit 2
+    }
+  fi
+
+  local old_pane
+  old_pane=$(cat "$old_run_dir/.pane_id")
+  local old_rid
+  old_rid=$(basename "$old_run_dir")
+
+  # Verify pane is alive
+  if ! pane_alive "$old_pane"; then
+    echo "ERROR: Pane $old_pane for $old_rid is dead. Use: ./orc_agent spawn $role \"$goal\""
+    exit 2
+  fi
+
+  # Verify agent is done (don't hijack a working agent)
+  if [ ! -f "$old_run_dir/.done_time" ]; then
+    echo "ERROR: $old_rid is still working. Wait or use: ./orc_agent retry $old_rid"
+    exit 1
+  fi
+
+  reuse_pane_for_task "$old_run_dir" "$role" "$goal"
 }
 
 # ---------------------------------------------------------------------------
@@ -456,7 +979,9 @@ cmd_retry() {
   pane=$(cat "$run_dir/.pane_id" 2>/dev/null || echo "")
   role=$(jq -r '.role // "?"' "$run_dir/.agent_meta.json" 2>/dev/null || echo "?")
 
-  [ -z "$pane" ] || ! pane_alive "$pane" && { echo "ERROR: $run_id pane dead, cannot retry"; exit 2; }
+  if [ -z "$pane" ] || ! pane_alive "$pane"; then
+    echo "ERROR: $run_id pane dead, cannot retry"; exit 2
+  fi
 
   if [ -z "$new_goal" ]; then
     goal=$(jq -r '.goal // ""' "$run_dir/.agent_meta.json" 2>/dev/null || echo "")
@@ -546,9 +1071,15 @@ cmd_check_all() {
     # Notify main agent
     if [ -n "$MAIN_PANE" ] && pane_alive "$MAIN_PANE"; then
       local short_alert="AGENT_ALERT: $count agent(s) need attention. Run: ./orc_agent list"
-      tmux send-keys -t "$MAIN_PANE" -l "$short_alert"
-      sleep 0.3
-      tmux send-keys -t "$MAIN_PANE" Enter
+      local sendkeys_lock="$SESSION_DIR/.sendkeys_lock"
+      if acquire_lock "$sendkeys_lock" 15; then
+        tmux send-keys -t "$MAIN_PANE" -l "$short_alert"
+        sleep 0.3
+        tmux send-keys -t "$MAIN_PANE" Enter
+        release_lock "$sendkeys_lock"
+      else
+        log_event "$SESSION_DIR" "warn" "send-keys lock timeout for check-all alert"
+      fi
       log_event "$SESSION_DIR" "warn" "check-all: $count problems, main agent notified"
     fi
   else
@@ -563,24 +1094,36 @@ cmd_check_all() {
 cmd_list() {
   echo "Session: $SID | Main: $MAIN_PANE | Timeout: ${AGENT_TIMEOUT}s"
   echo ""
-  printf "  %-10s %-12s %-8s %-6s %-5s %-10s %s\n" "RUN" "ROLE" "POS" "ALIVE" "DONE" "ELAPSED" "PANE"
-  printf "  %s\n" "$(printf '%.0s─' {1..70})"
+  printf "  %-10s %-12s %-8s %-6s %-5s %-8s %-10s %s\n" "RUN" "ROLE" "POS" "ALIVE" "DONE" "REUSE" "ELAPSED" "PANE"
+  printf "  %s\n" "$(printf '%.0s─' {1..85})"
 
   local has=false
+  local reusable_count=0
   for run_dir in "$SESSION_DIR"/runs/run-*; do
     [ -d "$run_dir" ] || continue
     has=true
 
-    local rid role pane col row alive="dead" pos elapsed_str="?" done_mark="no"
+    local rid role pane col row alive="dead" pos elapsed_str="?" done_mark="no" reuse_mark="-" reused_from=""
     rid=$(basename "$run_dir")
     role=$(jq -r '.role // "?"' "$run_dir/.agent_meta.json" 2>/dev/null || echo "?")
     pane=$(jq -r '.pane_id // "?"' "$run_dir/.agent_meta.json" 2>/dev/null || echo "?")
     col=$(jq -r '.col // -1' "$run_dir/.agent_meta.json" 2>/dev/null || echo "-1")
     row=$(jq -r '.row // -1' "$run_dir/.agent_meta.json" 2>/dev/null || echo "-1")
+    reused_from=$(jq -r '.reused_from // ""' "$run_dir/.agent_meta.json" 2>/dev/null || echo "")
 
     [ "$col" = "-1" ] && pos="window" || pos="c${col}r${row}"
-    [ -f "$run_dir/.pane_id" ] && pane_alive "$(cat "$run_dir/.pane_id")" && alive="alive"
+
+    local pane_is_alive=false
+    [ -f "$run_dir/.pane_id" ] && pane_alive "$(cat "$run_dir/.pane_id")" && { alive="alive"; pane_is_alive=true; }
     [ -f "$run_dir/.done_time" ] && done_mark="YES"
+
+    # Show reuse status
+    if [ -n "$reused_from" ]; then
+      reuse_mark="<$reused_from"
+    elif [ "$done_mark" = "YES" ] && $pane_is_alive; then
+      reuse_mark="READY"
+      reusable_count=$((reusable_count + 1))
+    fi
 
     if [ -f "$run_dir/.spawn_time" ]; then
       local st now_ts el
@@ -588,10 +1131,15 @@ cmd_list() {
       [ "$el" -gt "$AGENT_TIMEOUT" ] && elapsed_str="${el}s!" || elapsed_str="${el}s"
     fi
 
-    printf "  %-10s %-12s %-8s %-6s %-5s %-10s %s\n" "$rid" "$role" "$pos" "$alive" "$done_mark" "$elapsed_str" "$pane"
+    printf "  %-10s %-12s %-8s %-6s %-5s %-8s %-10s %s\n" "$rid" "$role" "$pos" "$alive" "$done_mark" "$reuse_mark" "$elapsed_str" "$pane"
   done
 
   $has || echo "  No agents spawned yet."
+
+  if [ "$reusable_count" -gt 0 ]; then
+    echo ""
+    echo "  $reusable_count pane(s) READY for reuse. spawn auto-reuses, or: ./orc_agent reassign <role> \"<goal>\""
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -602,10 +1150,16 @@ cmd_help() {
   cat <<'EOF'
 orc_agent — subagent orchestration
 
-SPAWN:
-  ./orc_agent spawn <role> "<goal>"             grid pane
+SPAWN (auto-reuses completed panes when available):
+  ./orc_agent spawn <role> "<goal>"             grid pane (auto-reuse first!)
   ./orc_agent spawn-window <role> "<goal>"      separate window
-  Batch: ./orc_agent spawn explorer "a" && ./orc_agent spawn researcher "b"
+  Batch: ./orc_agent spawn explorer "a" & ./orc_agent spawn researcher "b" &
+  Disable auto-reuse: ORC_NO_REUSE=1 ./orc_agent spawn ...
+
+REASSIGN (explicitly reuse a completed agent's pane with new role+task):
+  ./orc_agent reassign <role> "<goal>"                  auto-pick first done pane
+  ./orc_agent reassign <old_run_id> <role> "<goal>"     reuse specific done agent
+  Uses /new to reset OpenCode conversation, then sends new task. Much faster than spawn!
 
 DONE (subagent reports result — file-safe):
   ./orc_agent done <run_id> "<result summary>"
@@ -616,14 +1170,15 @@ REPLY (raw send to pane):
 HEALTH:
   ./orc_agent ping <run_id>       check alive + timeout (exit: 0=ok 2=dead 3=timeout)
   ./orc_agent check-all           scan all, notify main of problems
-  ./orc_agent retry <run_id>      /new + resend same task
+  ./orc_agent retry <run_id>      /new + resend same task (same role)
   ./orc_agent retry <run_id> "better goal"
 
 LIST:
-  ./orc_agent list
+  ./orc_agent list                shows all agents + READY-for-reuse status
 
-ROLES: researcher explorer reviewer summarizer verifier
+ROLES: researcher explorer reviewer summarizer verifier coder
 TIMEOUT: default 180s. ORC_AGENT_TIMEOUT=300 ./orc_agent spawn ...
+REUSE: spawn auto-reuses done panes. ORC_NO_REUSE=1 to force new pane.
 EOF
 }
 
@@ -638,6 +1193,7 @@ CMD="$1"; shift
 case "$CMD" in
   spawn)        [ $# -lt 2 ] && { echo "Usage: ./orc_agent spawn <role> <goal>" >&2; exit 1; };        cmd_spawn "$@" ;;
   spawn-window) [ $# -lt 2 ] && { echo "Usage: ./orc_agent spawn-window <role> <goal>" >&2; exit 1; }; cmd_spawn_window "$@" ;;
+  reassign)     [ $# -lt 2 ] && { echo "Usage: ./orc_agent reassign [run_id] <role> <goal>" >&2; exit 1; }; cmd_reassign "$@" ;;
   done)         [ $# -lt 2 ] && { echo "Usage: ./orc_agent done <run_id> <summary>" >&2; exit 1; };    cmd_done "$@" ;;
   reply)        [ $# -lt 2 ] && { echo "Usage: ./orc_agent reply <pane_id> <message>" >&2; exit 1; };  cmd_reply "$@" ;;
   ping)         [ $# -lt 1 ] && { echo "Usage: ./orc_agent ping <run_id>" >&2; exit 1; };              cmd_ping "$1" ;;

@@ -61,12 +61,26 @@ SID=$(generate_session_id)
 SESSION_DIR="$WORKDIR/$ORC_DIR/sessions/$SID"
 mkdir -p "$SESSION_DIR/runs"
 
-# Save session metadata
+# ---------------------------------------------------------------------------
+# Create git worktree for session isolation
+# ---------------------------------------------------------------------------
+WORKTREE_PATH="$WORKDIR"
+WORKTREE_BRANCH=""
+
+if git -C "$WORKDIR" rev-parse --is-inside-work-tree &>/dev/null; then
+  WORKTREE_BRANCH=$(get_session_branch "$SID")
+  WORKTREE_PATH=$(create_session_worktree "$SID" "$WORKDIR")
+  log_event "$SESSION_DIR" "info" "Worktree: $WORKTREE_PATH (branch: $WORKTREE_BRANCH)"
+fi
+
+# Save session metadata (with worktree info)
 cat > "$SESSION_DIR/session.json" <<EOF
 {
   "session_id": "$SID",
   "session_name": "$SESSION_NAME",
   "workdir": "$WORKDIR",
+  "worktree_path": "$WORKTREE_PATH",
+  "worktree_branch": "$WORKTREE_BRANCH",
   "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "status": "active"
 }
@@ -75,11 +89,18 @@ EOF
 # Initialize event log
 log_event "$SESSION_DIR" "info" "Session $SID created"
 
-# Save latest session pointer for convenience
+# Save latest session pointer for convenience (kept for backward compat)
 echo "$SID" > "$WORKDIR/$ORC_DIR/latest-session"
+
+# Register in active-sessions directory (supports multiple concurrent sessions)
+register_active_session "$WORKDIR" "$SID"
 
 orc_info "Session ID: $SID"
 orc_info "Session dir: $SESSION_DIR"
+if [ "$WORKTREE_PATH" != "$WORKDIR" ]; then
+  orc_info "Worktree: $WORKTREE_PATH"
+  orc_info "Branch: $WORKTREE_BRANCH"
+fi
 
 # ---------------------------------------------------------------------------
 # Create tmux session
@@ -87,12 +108,14 @@ orc_info "Session dir: $SESSION_DIR"
 
 # Create session with main window — full viewport, no splits
 # Each subagent will get its own WINDOW (via orc_agent spawn)
-tmux new-session -d -s "$SESSION_NAME" -n main -x 220 -y 50
+# Use 220x55 for more vertical headroom (50 was too tight for 4-row grid with separators)
+tmux new-session -d -s "$SESSION_NAME" -n main -x 220 -y 55
 
 tmux select-pane -t "$SESSION_NAME":main.0 -T "orc:main"
 
 # Start opencode in main window (gets full viewport)
-tmux send-keys -t "$SESSION_NAME":main.0 "cd $WORKDIR && opencode" Enter
+# Use worktree path if available for file isolation
+tmux send-keys -t "$SESSION_NAME":main.0 "cd $WORKTREE_PATH && OPENCODE_MESSAGE_QUEUE_MODE=hold opencode" Enter
 
 # Go back to main window
 tmux select-window -t "$SESSION_NAME":main
@@ -138,7 +161,9 @@ if wait_for_prompt "$MAIN_PANE_ID" 30; then
 
 - Session ID: $SID
 - Your pane ID: $MAIN_PANE_ID
-- Working directory: $WORKDIR
+- Working directory: $WORKTREE_PATH
+- Project root: $WORKDIR
+- Session branch: $WORKTREE_BRANCH
 
 ## QUICK REFERENCE
 
@@ -147,8 +172,8 @@ if wait_for_prompt "$MAIN_PANE_ID" 30; then
 ./orc_agent spawn explorer "map the project structure"
 ./orc_agent spawn researcher "compare X vs Y"
 
-# Batch spawn:
-./orc_agent spawn explorer "goal" && ./orc_agent spawn researcher "goal2"
+# Batch spawn (parallel — & runs in background, wait collects all):
+./orc_agent spawn explorer "goal" & ./orc_agent spawn researcher "goal2" & wait
 
 # Reply to a specific agent pane:
 ./orc_agent reply <pane_id> "follow-up message"

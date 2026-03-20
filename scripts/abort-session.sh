@@ -102,5 +102,15 @@ if session_exists "$SESSION_NAME"; then
   tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
 fi
 
+# ---------------------------------------------------------------------------
+# Clean up worktree (but keep the branch for history)
+# ---------------------------------------------------------------------------
+
+WORKDIR=$(jq -r '.workdir // ""' "$SESSION_DIR/session.json" 2>/dev/null || echo "")
+if [ -n "$WORKDIR" ]; then
+  cleanup_session_worktree "$SID" "$WORKDIR"
+  deregister_active_session "$WORKDIR" "$SID"
+fi
+
 log_event "$SESSION_DIR" "warn" "session $SID aborted"
-orc_ok "Session $SID aborted. All runs marked as cancelled."
+orc_ok "Session $SID aborted. All runs marked as cancelled. Branch kept for history."

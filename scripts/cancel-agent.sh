@@ -49,6 +49,14 @@ if [ -f "$RUN_DIR/.pane_id" ]; then
   PANE_ID=$(cat "$RUN_DIR/.pane_id")
   orc_info "Killing pane $PANE_ID for $RUN_ID..."
   tmux kill-pane -t "$PANE_ID" 2>/dev/null || true
+
+  # Remove pane from layout file so equalize_layout calculations stay accurate
+  LAYOUT_FILE="$SESSION_DIR/.layout_panes"
+  if [ -f "$LAYOUT_FILE" ]; then
+    TEMP_LAYOUT="${LAYOUT_FILE}.tmp.$$"
+    grep -v "^${PANE_ID}$" "$LAYOUT_FILE" > "$TEMP_LAYOUT" 2>/dev/null || true
+    mv "$TEMP_LAYOUT" "$LAYOUT_FILE"
+  fi
 else
   orc_warn "No pane_id found for $RUN_ID"
 fi

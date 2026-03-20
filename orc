@@ -3,11 +3,14 @@
 # orc — unified CLI for opencode-orc orchestration
 # =============================================================================
 # Usage:
-#   orc start              Start a new session (tmux + opencode)
+#   orc start              Start a new session (tmux + opencode + git worktree)
 #   orc list               Show all sessions
 #   orc status <sid>       Detailed status of a session
 #   orc attach [sid]       Attach to session's tmux (latest if no sid)
 #   orc logs [sid]         Tail event log (latest if no sid)
+#   orc commit [message]   Commit changes in session branch
+#   orc push [remote]      Push session branch to remote
+#   orc finish [message]   Commit + push + finalize session
 #   orc abort <sid>        Kill a session
 #   orc cancel <sid> <rid> Cancel a single run
 #   orc recover <sid>      Diagnose and recover a session
@@ -185,6 +188,71 @@ cmd_recover() {
   "$SCRIPT_DIR/recover-session.sh" "$sid"
 }
 
+# ---------------------------------------------------------------------------
+# Git commands: commit, push, finish
+# ---------------------------------------------------------------------------
+
+cmd_commit() {
+  local sid
+  sid=$(require_sid "")
+  local sdir
+  sdir=$(get_session_dir "$sid")
+  local workdir
+  workdir=$(jq -r '.worktree_path // .workdir // "."' "$sdir/session.json" 2>/dev/null || pwd)
+  local message="${1:-orc: manual commit for $sid}"
+
+  session_commit "$workdir" "$message"
+}
+
+cmd_push() {
+  local sid
+  sid=$(require_sid "")
+  local sdir
+  sdir=$(get_session_dir "$sid")
+  local workdir
+  workdir=$(jq -r '.worktree_path // .workdir // "."' "$sdir/session.json" 2>/dev/null || pwd)
+  local remote="${1:-origin}"
+
+  session_push "$workdir" "$remote"
+}
+
+cmd_finish() {
+  local sid
+  sid=$(require_sid "")
+  local sdir
+  sdir=$(get_session_dir "$sid")
+  local workdir
+  workdir=$(jq -r '.worktree_path // .workdir // "."' "$sdir/session.json" 2>/dev/null || pwd)
+  local project_root
+  project_root=$(jq -r '.workdir // "."' "$sdir/session.json" 2>/dev/null || pwd)
+  local message="${1:-orc: finish session $sid}"
+
+  orc_info "Finishing session $sid..."
+
+  # 1. Commit any remaining changes
+  session_commit "$workdir" "$message"
+
+  # 2. Push to remote
+  session_push "$workdir"
+
+  # 3. Update session status
+  if [ -f "$sdir/session.json" ]; then
+    local tmp
+    tmp=$(mktemp)
+    jq '.status = "finished" | .finished_at = "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"' \
+      "$sdir/session.json" > "$tmp" && mv "$tmp" "$sdir/session.json"
+  fi
+
+  # 4. Deregister active session
+  deregister_active_session "$project_root" "$sid"
+
+  # 5. Clean up worktree (keep branch)
+  cleanup_session_worktree "$sid" "$project_root"
+
+  log_event "$sdir" "info" "session $sid finished"
+  orc_ok "Session $sid finished. Changes committed and pushed. Branch kept for history."
+}
+
 cmd_help() {
   cat <<'EOF'
 
@@ -192,7 +260,7 @@ cmd_help() {
 
   COMMANDS:
     start [name]           Start new session. Auto-attaches to tmux.
-                           Orchestration loop runs in background.
+                           Creates git worktree for isolation.
 
     list                   Show all sessions with status overview.
 
@@ -205,8 +273,16 @@ cmd_help() {
     logs [sid]             Tail the event log (pretty-printed).
                            Uses latest session if sid omitted.
 
+    commit [message]       Commit all current changes in session branch.
+                           Default message: "orc: manual commit for <sid>"
+
+    push [remote]          Push session branch to remote (default: origin).
+
+    finish [message]       Commit + push + finalize session.
+                           Cleans up worktree, keeps branch for history.
+
     abort [sid]            Kill session: watchdog, tmux, all runs.
-                           Asks for confirmation.
+                           Cleans up worktree, keeps branch. Asks for confirmation.
 
     cancel <sid> <rid>     Cancel a single subagent run.
 
@@ -218,6 +294,9 @@ cmd_help() {
     orc start              # start session, auto-attach
     orc list               # see all sessions
     orc attach             # re-attach to latest session
+    orc commit "my changes" # commit changes in session branch
+    orc push               # push session branch
+    orc finish "done"      # commit + push + finalize
     orc logs               # watch event stream
     orc abort session-20260318-232850
     orc cancel session-20260318-232850 run-001
@@ -238,6 +317,9 @@ case "$CMD" in
   status)  cmd_status "$@" ;;
   attach)  cmd_attach "$@" ;;
   logs)    cmd_logs "$@" ;;
+  commit)  cmd_commit "$@" ;;
+  push)    cmd_push "$@" ;;
+  finish)  cmd_finish "$@" ;;
   abort)   cmd_abort "$@" ;;
   cancel)  cmd_cancel "$@" ;;
   recover) cmd_recover "$@" ;;

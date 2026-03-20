@@ -32,6 +32,24 @@ RUN_TIMEOUT="${3:-300}"     # seconds until run is considered stuck
 PANE_SILENCE="${4:-120}"    # seconds of pane silence = warning
 
 # ---------------------------------------------------------------------------
+# Disk space check
+# ---------------------------------------------------------------------------
+
+MIN_DISK_KB=102400  # 100MB minimum
+
+check_disk_space() {
+  local avail_kb
+  avail_kb=$(df -k . 2>/dev/null | awk 'NR==2{print $4}')
+  if [ -z "$avail_kb" ] || [ "$avail_kb" = "0" ]; then
+    return 1  # cannot determine — treat as warning
+  fi
+  if [ "$avail_kb" -lt "$MIN_DISK_KB" ]; then
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Main check function
 # ---------------------------------------------------------------------------
 
@@ -40,16 +58,20 @@ check_run() {
   local run_id
   run_id=$(basename "$run_dir")
 
-  # Already finished?
+  # Already finished? (orc_agent creates .done_time; legacy agents create DONE)
   [ -f "$run_dir/DONE" ] && return 0
   [ -f "$run_dir/FAILED" ] && return 0
+  [ -f "$run_dir/.done_time" ] && return 0
 
-  # Must have spec.md to be a valid run
-  [ -f "$run_dir/spec.md" ] || return 0
+  # Must have spec.md or .spawn_time to be a valid run
+  # orc_agent creates .spawn_time (not spec.md), so check both
+  [ -f "$run_dir/spec.md" ] || [ -f "$run_dir/.spawn_time" ] || return 0
 
-  # Check age of run (time since spec.md was created)
+  # Check age of run — prefer .spawn_time (accurate), fall back to spec.md ctime
   local created
-  if [[ "$OSTYPE" == "darwin"* ]]; then
+  if [ -f "$run_dir/.spawn_time" ]; then
+    created=$(cat "$run_dir/.spawn_time" 2>/dev/null || echo 0)
+  elif [[ "$OSTYPE" == "darwin"* ]]; then
     created=$(stat -f %m "$run_dir/spec.md" 2>/dev/null || echo 0)
   else
     created=$(stat -c %Y "$run_dir/spec.md" 2>/dev/null || echo 0)
@@ -119,6 +141,11 @@ while true; do
   if [ ! -d "$SESSION_DIR" ]; then
     echo "Session directory gone, watchdog exiting" >&2
     exit 0
+  fi
+
+  # Disk space check
+  if ! check_disk_space; then
+    log_event "$SESSION_DIR" "error" "CRITICAL: Disk space below ${MIN_DISK_KB}KB — agents may fail to write markers"
   fi
 
   # Check all runs

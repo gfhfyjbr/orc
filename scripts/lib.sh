@@ -15,7 +15,7 @@ set -euo pipefail
 ORC_DIR=".orchestrator"
 DEFAULT_SESSION="opencode-orc"
 MAX_CONCURRENT_AGENTS=3
-VALID_ROLES='["researcher","explorer","reviewer","summarizer","verifier"]'
+VALID_ROLES='["researcher","explorer","reviewer","summarizer","verifier","coder"]'
 
 # Colors for terminal output
 RED='\033[0;31m'
@@ -23,6 +23,59 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
+
+# ---------------------------------------------------------------------------
+# Portable locking (mkdir-based, works on macOS + Linux without flock)
+# ---------------------------------------------------------------------------
+
+# Acquire a lock using atomic mkdir.
+# Usage: acquire_lock <lock_path> [timeout_seconds]
+# Creates <lock_path>/ directory as lock. Writes PID to <lock_path>/pid.
+# Retries with backoff until timeout. Detects stale locks via PID liveness.
+# Returns 0 on success, 1 on timeout.
+acquire_lock() {
+  local lock_path="$1"
+  local timeout="${2:-10}"
+  local elapsed=0
+  local sleep_interval=0.1
+
+  while [ "$elapsed" -lt "$timeout" ]; do
+    if mkdir "$lock_path" 2>/dev/null; then
+      # Lock acquired — record our PID for stale detection
+      echo $$ > "$lock_path/pid"
+      return 0
+    fi
+
+    # Lock exists — check if holder is still alive (stale lock detection)
+    if [ -f "$lock_path/pid" ]; then
+      local holder_pid
+      holder_pid=$(cat "$lock_path/pid" 2>/dev/null || echo "")
+      if [ -n "$holder_pid" ] && ! kill -0 "$holder_pid" 2>/dev/null; then
+        # Holder is dead — remove stale lock and retry immediately
+        rm -rf "$lock_path" 2>/dev/null || true
+        continue
+      fi
+    fi
+
+    sleep "$sleep_interval"
+    elapsed=$((elapsed + 1))
+    # Back off: 0.1 -> 0.2 -> 0.5 -> 1s
+    case "$elapsed" in
+      [1-3]) sleep_interval=0.2 ;;
+      [4-6]) sleep_interval=0.5 ;;
+      *)     sleep_interval=1 ;;
+    esac
+  done
+
+  return 1  # Timeout
+}
+
+# Release a lock.
+# Usage: release_lock <lock_path>
+release_lock() {
+  local lock_path="$1"
+  rm -rf "$lock_path" 2>/dev/null || true
+}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -36,13 +89,15 @@ orc_error() { printf "${RED}[orc]${NC} %s\n" "$*" >&2; }
 
 # Write structured event to session's event-log.jsonl
 # Usage: log_event <session_dir> <level> <message>
+# Uses jq for safe JSON construction (no injection via special chars).
 log_event() {
   local session_dir="$1"
   local level="$2"
   local msg="$3"
   local ts
   ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  printf '{"ts":"%s","level":"%s","msg":"%s"}\n' "$ts" "$level" "$msg" \
+  jq -c -n --arg ts "$ts" --arg level "$level" --arg msg "$msg" \
+    '{"ts":$ts,"level":$level,"msg":$msg}' \
     >> "$session_dir/event-log.jsonl"
 }
 
@@ -56,13 +111,17 @@ generate_session_id() {
   printf 'session-%s' "$(date +%Y%m%d-%H%M%S)"
 }
 
-# Generate next run ID for a session
+# Generate next run ID for a session (race-condition safe).
+# Uses atomic mkdir to claim the run directory — two parallel calls
+# will never get the same ID.
 # Usage: generate_run_id <session_dir>
 generate_run_id() {
   local session_dir="$1"
   local runs_dir="$session_dir/runs"
-  local max_num=0
+  mkdir -p "$runs_dir"
 
+  # Find current max to start from (optimization, not for correctness)
+  local max_num=0
   if [ -d "$runs_dir" ]; then
     for d in "$runs_dir"/run-*; do
       [ -d "$d" ] || continue
@@ -75,7 +134,19 @@ generate_run_id() {
     done
   fi
 
-  printf 'run-%03d' "$((max_num + 1))"
+  # Atomically claim the next available run directory via mkdir
+  local candidate=$((max_num + 1))
+  local run_id
+  while true; do
+    run_id=$(printf 'run-%03d' "$candidate")
+    if mkdir "$runs_dir/$run_id" 2>/dev/null; then
+      # Successfully claimed this ID
+      printf '%s' "$run_id"
+      return 0
+    fi
+    # Directory already exists (race or pre-existing) — try next
+    candidate=$((candidate + 1))
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -83,11 +154,16 @@ generate_run_id() {
 # ---------------------------------------------------------------------------
 
 # Get the project root (where .orchestrator/ lives)
-# Walks up from CWD looking for .orchestrator/ or .git/
+# Walks up from CWD looking for .orchestrator/ or .git/ (supports git worktrees)
 get_project_root() {
   local dir="$PWD"
   while [ "$dir" != "/" ]; do
-    if [ -d "$dir/.orchestrator" ] || [ -d "$dir/.git" ]; then
+    if [ -d "$dir/.orchestrator" ]; then
+      printf '%s' "$dir"
+      return 0
+    fi
+    # Support both regular repos (.git is dir) and worktrees (.git is file)
+    if [ -d "$dir/.git" ] || [ -f "$dir/.git" ]; then
       printf '%s' "$dir"
       return 0
     fi
@@ -200,6 +276,7 @@ count_active_agents() {
     [ -d "$run_dir" ] || continue
     [ -f "$run_dir/DONE" ] && continue
     [ -f "$run_dir/FAILED" ] && continue
+    [ -f "$run_dir/.done_time" ] && continue
     if [ -f "$run_dir/.pane_id" ]; then
       local pid
       pid=$(cat "$run_dir/.pane_id")
@@ -333,10 +410,10 @@ validate_plan() {
 # Run status helpers
 # ---------------------------------------------------------------------------
 
-# Check if a run is complete (DONE marker exists)
+# Check if a run is complete (DONE marker or .done_time exists)
 # Usage: run_is_done <run_dir>
 run_is_done() {
-  [ -f "$1/DONE" ]
+  [ -f "$1/DONE" ] || [ -f "$1/.done_time" ]
 }
 
 # Check if a run has failed (FAILED marker exists)
@@ -345,10 +422,10 @@ run_is_failed() {
   [ -f "$1/FAILED" ]
 }
 
-# Check if a run is finished (either DONE or FAILED)
+# Check if a run is finished (either DONE, .done_time, or FAILED)
 # Usage: run_is_finished <run_dir>
 run_is_finished() {
-  [ -f "$1/DONE" ] || [ -f "$1/FAILED" ]
+  [ -f "$1/DONE" ] || [ -f "$1/.done_time" ] || [ -f "$1/FAILED" ]
 }
 
 # Wait for a run to finish (DONE or FAILED marker)
@@ -361,7 +438,7 @@ wait_for_run() {
   run_id=$(basename "$run_dir")
 
   while [ "$elapsed" -lt "$timeout" ]; do
-    if [ -f "$run_dir/DONE" ]; then
+    if [ -f "$run_dir/DONE" ] || [ -f "$run_dir/.done_time" ]; then
       orc_ok "Run $run_id completed"
       return 0
     fi
@@ -388,128 +465,201 @@ EOF
   return 1
 }
 
+# REMOVED: generate_spec and generate_bootstrap_prompt (legacy file-based protocol, replaced by orc_agent done)
+
 # ---------------------------------------------------------------------------
-# Spec generation
+# Active session registry (replaces singleton latest-session)
 # ---------------------------------------------------------------------------
 
-# Generate spec.md for a subagent run from plan task data
-# Usage: generate_spec <run_dir> <session_id> <run_id> <role> <goal> <inputs_json> <deliverables_json>
-generate_spec() {
-  local run_dir="$1"
-  local session_id="$2"
-  local run_id="$3"
-  local role="$4"
-  local goal="$5"
-  local inputs_json="$6"
-  local deliverables_json="$7"
-  local workspace
-  workspace=$(get_project_root)
+# Register a session as active.
+# Creates a file in .orchestrator/active-sessions/ named by SID.
+# Usage: register_active_session <project_root> <session_id>
+register_active_session() {
+  local root="$1"
+  local sid="$2"
+  local active_dir="$root/$ORC_DIR/active-sessions"
+  mkdir -p "$active_dir"
+  echo "$$" > "$active_dir/$sid"
+}
 
-  # Load role-specific profile from templates
-  local script_dir
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  local template_dir="$script_dir/../templates/specs"
-  local profile=""
+# Deregister a session (called on abort/finish).
+# Usage: deregister_active_session <project_root> <session_id>
+deregister_active_session() {
+  local root="$1"
+  local sid="$2"
+  rm -f "$root/$ORC_DIR/active-sessions/$sid" 2>/dev/null || true
+}
 
-  if [ -f "$template_dir/${role}.md" ]; then
-    profile=$(cat "$template_dir/${role}.md")
-  else
-    profile="You are a $role subagent. Work strictly within your assigned scope."
+# List all active session IDs.
+# Usage: list_active_sessions <project_root>
+list_active_sessions() {
+  local root="$1"
+  local active_dir="$root/$ORC_DIR/active-sessions"
+  [ ! -d "$active_dir" ] && return
+  for f in "$active_dir"/session-*; do
+    [ -f "$f" ] || continue
+    basename "$f"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Git worktree helpers
+# ---------------------------------------------------------------------------
+
+# Get the session branch name for a given session ID.
+# Format: orc/<session_id>
+# Usage: get_session_branch <session_id>
+get_session_branch() {
+  local sid="$1"
+  printf 'orc/%s' "$sid"
+}
+
+# Create a git worktree for a session.
+# Creates branch orc/<session_id> from current HEAD and sets up worktree.
+# Usage: create_session_worktree <session_id> <project_root>
+# Returns: worktree path on stdout, 0 on success, 1 on failure
+create_session_worktree() {
+  local sid="$1"
+  local project_root="$2"
+  local branch
+  branch=$(get_session_branch "$sid")
+  local worktree_dir="$project_root/$ORC_DIR/worktrees/$sid"
+
+  # Check if git is available and we're in a repo
+  if ! git -C "$project_root" rev-parse --is-inside-work-tree &>/dev/null; then
+    orc_warn "Not a git repository — skipping worktree creation"
+    printf '%s' "$project_root"
+    return 0
   fi
 
-  # Format inputs as list
-  local inputs_list
-  inputs_list=$(echo "$inputs_json" | jq -r '.[]? // empty' 2>/dev/null | sed 's/^/- /')
-  [ -z "$inputs_list" ] && inputs_list="- (no specific inputs)"
+  # If worktree already exists, just return its path
+  if [ -d "$worktree_dir" ]; then
+    orc_info "Worktree already exists: $worktree_dir"
+    printf '%s' "$worktree_dir"
+    return 0
+  fi
 
-  # Format deliverables as numbered list
-  local deliverables_list
-  deliverables_list=$(echo "$deliverables_json" | jq -r '.[]? // empty' 2>/dev/null | nl -ba | sed 's/^[[:space:]]*//')
-  [ -z "$deliverables_list" ] && deliverables_list="1. Result summary"
+  # Create the branch from current HEAD (if it doesn't exist)
+  if ! git -C "$project_root" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
+    git -C "$project_root" branch "$branch" HEAD 2>/dev/null || {
+      orc_warn "Failed to create branch $branch — using project root"
+      printf '%s' "$project_root"
+      return 0
+    }
+  fi
 
-  cat > "$run_dir/spec.md" <<EOF
-# Subagent Spec
-
-- run_id: $run_id
-- role: $role
-- session: $session_id
-- workspace: $workspace
-
-## Agent Profile
-
-$profile
-
-## Goal
-
-$goal
-
-## Input Context
-
-$inputs_list
-
-## Constraints
-
-- Work strictly within the scope defined above.
-- Do not attempt to answer the user directly — your output is for the main agent.
-- Do not modify code outside your assigned scope.
-- Record results in the specified output files.
-
-## Deliverables
-
-$deliverables_list
-
-## Output Files
-
-Write files in this exact order:
-1. \`$run_dir/status.json\` — update periodically as you work (optional)
-2. \`$run_dir/result.json\` — machine-readable structured result
-3. \`$run_dir/handoff.md\` — human-readable summary for main agent
-4. \`$run_dir/DONE\` — final marker (create ONLY after all other files are written)
-
-### DONE marker format:
-\`\`\`json
-{
-  "run_id": "$run_id",
-  "role": "$role",
-  "status": "completed",
-  "files": ["result.json", "handoff.md"],
-  "completed_at": "<ISO-8601 timestamp>"
+  # Create the worktree
+  mkdir -p "$(dirname "$worktree_dir")"
+  if git -C "$project_root" worktree add "$worktree_dir" "$branch" 2>/dev/null; then
+    orc_ok "Created worktree: $worktree_dir (branch: $branch)"
+    printf '%s' "$worktree_dir"
+    return 0
+  else
+    orc_warn "Failed to create worktree — using project root"
+    printf '%s' "$project_root"
+    return 0
+  fi
 }
-\`\`\`
 
-If you cannot complete the task, create \`$run_dir/FAILED\` instead of \`DONE\`:
-\`\`\`json
-{
-  "run_id": "$run_id",
-  "status": "failed",
-  "reason": "<description of what went wrong>",
-  "failed_at": "<ISO-8601 timestamp>"
-}
-\`\`\`
-EOF
+# Remove a git worktree for a session.
+# Usage: cleanup_session_worktree <session_id> <project_root>
+cleanup_session_worktree() {
+  local sid="$1"
+  local project_root="$2"
+  local worktree_dir="$project_root/$ORC_DIR/worktrees/$sid"
+
+  if [ ! -d "$worktree_dir" ]; then
+    return 0
+  fi
+
+  if git -C "$project_root" rev-parse --is-inside-work-tree &>/dev/null; then
+    git -C "$project_root" worktree remove "$worktree_dir" --force 2>/dev/null || {
+      orc_warn "git worktree remove failed — removing directory manually"
+      rm -rf "$worktree_dir" 2>/dev/null || true
+      # Prune stale worktree entries
+      git -C "$project_root" worktree prune 2>/dev/null || true
+    }
+  else
+    rm -rf "$worktree_dir" 2>/dev/null || true
+  fi
 }
 
 # ---------------------------------------------------------------------------
-# Bootstrap prompt generation
+# Git commit/push helpers for sessions
 # ---------------------------------------------------------------------------
 
-# Generate the bootstrap prompt that will be sent to a subagent
-# Usage: generate_bootstrap_prompt <run_dir>
-generate_bootstrap_prompt() {
-  local run_dir="$1"
+# Commit all changes in a worktree/directory with a session-scoped message.
+# Usage: session_commit <workdir> <message>
+# Returns: 0 if committed (or nothing to commit), 1 on error
+session_commit() {
+  local workdir="$1"
+  local message="$2"
 
-  cat > "$run_dir/prompt.txt" <<EOF
-Read the file \`$run_dir/spec.md\`.
+  if ! git -C "$workdir" rev-parse --is-inside-work-tree &>/dev/null; then
+    orc_warn "Not a git repository — skipping commit"
+    return 0
+  fi
 
-Then:
-1. Execute the task strictly within the spec's scope.
-2. If appropriate, periodically update \`$run_dir/status.json\`.
-3. When finished, write files in this exact order:
-   - \`$run_dir/result.json\`
-   - \`$run_dir/handoff.md\`
-   - \`$run_dir/DONE\` (JSON with run_id, role, status, files, completed_at)
-4. Do NOT write a final answer to the user. Write results for the main agent.
-EOF
+  # Check if there are any changes to commit
+  if git -C "$workdir" diff --quiet HEAD 2>/dev/null && \
+     git -C "$workdir" diff --staged --quiet 2>/dev/null && \
+     [ -z "$(git -C "$workdir" ls-files --others --exclude-standard 2>/dev/null)" ]; then
+    orc_info "Nothing to commit"
+    return 0
+  fi
+
+  # Stage all changes (including untracked)
+  git -C "$workdir" add -A 2>/dev/null || {
+    orc_error "git add failed"
+    return 1
+  }
+
+  # Commit
+  git -C "$workdir" commit -m "$message" --no-verify 2>/dev/null || {
+    # Could be "nothing to commit" after add — not an error
+    orc_info "git commit returned non-zero (possibly nothing staged)"
+    return 0
+  }
+
+  orc_ok "Committed: $message"
+  return 0
+}
+
+# Push the session branch to remote.
+# Usage: session_push <workdir> [remote]
+# Returns: 0 on success, 1 on failure
+session_push() {
+  local workdir="$1"
+  local remote="${2:-origin}"
+
+  if ! git -C "$workdir" rev-parse --is-inside-work-tree &>/dev/null; then
+    orc_warn "Not a git repository — skipping push"
+    return 0
+  fi
+
+  local branch
+  branch=$(git -C "$workdir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  if [ -z "$branch" ]; then
+    orc_error "Cannot determine current branch"
+    return 1
+  fi
+
+  # Check if remote exists
+  if ! git -C "$workdir" remote get-url "$remote" &>/dev/null; then
+    orc_warn "Remote '$remote' not found — skipping push"
+    return 0
+  fi
+
+  git -C "$workdir" push "$remote" "$branch" 2>/dev/null || {
+    # Try with --set-upstream for new branches
+    git -C "$workdir" push -u "$remote" "$branch" 2>/dev/null || {
+      orc_error "git push failed"
+      return 1
+    }
+  }
+
+  orc_ok "Pushed branch $branch to $remote"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -550,7 +700,7 @@ dependencies_met() {
   local dep
   for dep in $deps; do
     local dep_dir="$session_dir/runs/$dep"
-    if [ ! -f "$dep_dir/DONE" ]; then
+    if [ ! -f "$dep_dir/DONE" ] && [ ! -f "$dep_dir/.done_time" ]; then
       return 1  # Dependency not yet done
     fi
   done
