@@ -15,7 +15,7 @@ set -euo pipefail
 ORC_DIR=".orchestrator"
 DEFAULT_SESSION="opencode-orc"
 MAX_CONCURRENT_AGENTS=3
-VALID_ROLES='["researcher","explorer","reviewer","summarizer","verifier","coder"]'
+VALID_ROLES='["researcher","explorer","reviewer","summarizer","verifier","coder","namer"]'
 
 # Colors for terminal output
 RED='\033[0;31m'

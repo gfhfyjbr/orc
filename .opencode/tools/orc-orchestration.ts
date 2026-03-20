@@ -234,3 +234,34 @@ export const check_all = tool({
     }
   },
 })
+
+/**
+ * Check or set session branch name.
+ * Tool name: orc-orchestration_session_name
+ */
+export const session_name = tool({
+  description:
+    "Get or set the session branch name. Use 'get' to check current name, 'set' to rename the branch following conventional commits format (e.g. feat/add-auth, fix/race-condition).",
+  args: {
+    action: tool.schema
+      .enum(["get", "set"])
+      .describe("Action: 'get' to check current name, 'set' to rename"),
+    name: tool.schema
+      .string()
+      .optional()
+      .describe(
+        "Branch name in conventional commits format: <type>/<description>. Required for 'set' action. Types: feat, fix, refactor, docs, test, chore, ci, perf, style, build, revert",
+      ),
+  },
+  async execute(args, context) {
+    try {
+      const result = args.action === "set" && args.name
+        ? await Bun.$`./orc_agent name set ${args.name}`.cwd(context.worktree)
+        : await Bun.$`./orc_agent name get`.cwd(context.worktree)
+      return result.text().trim()
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      return `ERROR: ${msg}`
+    }
+  },
+})
