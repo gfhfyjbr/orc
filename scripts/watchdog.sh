@@ -83,6 +83,8 @@ check_run() {
 
   # Timeout check
   if [ "$age" -gt "$RUN_TIMEOUT" ]; then
+    # Re-check: agent may have completed between initial check and now (TOCTOU)
+    [ -f "$run_dir/.done_time" ] && return 0
     log_event "$SESSION_DIR" "error" "run $run_id exceeded timeout (${age}s > ${RUN_TIMEOUT}s)"
     cat > "$run_dir/FAILED" <<EOF
 {
@@ -100,6 +102,8 @@ EOF
     local pane_id
     pane_id=$(cat "$run_dir/.pane_id")
     if ! pane_alive "$pane_id"; then
+      # Re-check: agent may have completed just before pane died (TOCTOU)
+      [ -f "$run_dir/.done_time" ] && return 0
       log_event "$SESSION_DIR" "error" "run $run_id: pane $pane_id is dead"
       cat > "$run_dir/FAILED" <<EOF
 {

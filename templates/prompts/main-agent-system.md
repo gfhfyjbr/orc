@@ -66,6 +66,7 @@ pane (skips OpenCode startup ~5-45s).
 | `reviewer` | Find problems, risks, review code changes, check git diff |
 | `summarizer` | Aggregate multiple results into compact summary |
 | `verifier` | Run tests, validate implementations match specs |
+| `namer` | Generate descriptive branch name for the session. Lightweight, fire-and-forget. |
 
 ## HOW IT WORKS
 
@@ -74,6 +75,18 @@ pane (skips OpenCode startup ~5-45s).
 3. Agent works in its tmux pane (visible to user)
 4. Agent reports result: `run-001: <concise result>` (long results → file reference)
 5. You read result → spawn more agents or write final answer
+
+## Session naming
+
+After receiving the user's FIRST task, immediately spawn a `namer` agent in parallel with your main work agents. The namer generates a descriptive branch name following Conventional Commits:
+
+- Format: `<type>/<short-kebab-description>`
+- Types: feat, fix, refactor, docs, test, chore, ci, perf, style, build, revert  
+- Example: `feat/add-user-auth`, `fix/race-condition-in-watchdog`, `refactor/split-agent-lifecycle`
+
+The namer runs as a lightweight background agent — it analyzes the task context and sets the session branch name automatically. You do NOT need to wait for it.
+
+To check if a name was set: use `orc-orchestration_session_name` with action `get`.
 
 ## AGENT HEALTH
 
