@@ -18,20 +18,41 @@ source "$SCRIPT_DIR/lib.sh"
 
 WORKDIR="${1:-$(get_project_root)}"
 SESSIONS_DIR="$WORKDIR/$ORC_DIR/sessions"
+ACTIVE_DIR="$WORKDIR/$ORC_DIR/active-sessions"
 
 if [ ! -d "$SESSIONS_DIR" ]; then
   orc_info "No sessions found. Run start-session.sh to create one."
   exit 0
 fi
 
+# Build list of active session IDs for lookup (bash 3.2 compatible — no assoc arrays)
+ACTIVE_SESSION_LIST=""
+ACTIVE_SESSION_COUNT=0
+if [ -d "$ACTIVE_DIR" ]; then
+  for af in "$ACTIVE_DIR"/session-*; do
+    [ -f "$af" ] || continue
+    ACTIVE_SESSION_LIST="$ACTIVE_SESSION_LIST:$(basename "$af")"
+    ACTIVE_SESSION_COUNT=$((ACTIVE_SESSION_COUNT + 1))
+  done
+fi
+
+# Check if a session is in active-sessions/ (bash 3.2 compatible)
+is_session_registered() {
+  local check_sid="$1"
+  case "$ACTIVE_SESSION_LIST" in
+    *":$check_sid"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
 
 printf '\n'
-printf '  %-28s %-18s %-10s %-8s %-22s %s\n' \
+printf '  %-28s %-18s %-12s %-8s %-22s %s\n' \
   "SESSION ID" "TMUX" "STATUS" "RUNS" "PROCESSES" "CREATED"
-printf '  %s\n' "$(printf '%.0s─' {1..110})"
+printf '  %s\n' "$(printf '%.0s─' {1..115})"
 
 # ---------------------------------------------------------------------------
 # Iterate sessions
@@ -97,9 +118,21 @@ for session_dir in "$SESSIONS_DIR"/session-*; do
   fi
   [ -z "$procs" ] && procs="-"
 
-  # Color status
+  # Check if registered in active-sessions
+  is_registered=false
+  if is_session_registered "$sid"; then
+    is_registered=true
+  fi
+
+  # Color status — append [REG] marker for registered active sessions
   case "$status" in
-    active)  status_display="${GREEN}active${NC}" ;;
+    active)
+      if $is_registered; then
+        status_display="${GREEN}active [R]${NC}"
+      else
+        status_display="${GREEN}active${NC}"
+      fi
+      ;;
     aborted) status_display="${RED}aborted${NC}" ;;
     *)       status_display="$status" ;;
   esac
@@ -110,8 +143,17 @@ for session_dir in "$SESSIONS_DIR"/session-*; do
     dead)  tmux_display="${tmux_name} ${RED}x${NC}" ;;
   esac
 
-  printf "  %-28s %-18b %-10b %-8s %-22s %s\n" \
+  printf "  %-28s %-18b %-12b %-8s %-22s %s\n" \
     "$sid" "$tmux_display" "$status_display" "$runs_summary" "$procs" "$created"
+
+  # Show worktree info for active sessions
+  if $is_registered; then
+    wt_path=$(jq -r '.worktree_path // ""' "$session_dir/session.json" 2>/dev/null || echo "")
+    wt_branch=$(jq -r '.worktree_branch // ""' "$session_dir/session.json" 2>/dev/null || echo "")
+    if [ -n "$wt_branch" ] && [ "$wt_path" != "$WORKDIR" ]; then
+      printf "    ${BLUE}↳ worktree: %s (branch: %s)${NC}\n" "$wt_path" "$wt_branch"
+    fi
+  fi
 
   # Show stuck runs if any
   if [ "$stuck_count" -gt 0 ]; then
@@ -131,8 +173,9 @@ printf '\n'
 if [ "$session_count" -eq 0 ]; then
   orc_info "No sessions found."
 else
-  # Count active tmux sessions
+  # Count active tmux sessions and registered sessions
   active_tmux=0
+  registered_count=$ACTIVE_SESSION_COUNT
   for session_dir in "$SESSIONS_DIR"/session-*; do
     [ -d "$session_dir" ] || continue
     if [ -f "$session_dir/session.json" ]; then
@@ -142,5 +185,7 @@ else
       fi
     fi
   done
-  printf "  Total: %d sessions, %d with active tmux\n\n" "$session_count" "$active_tmux"
+  printf "  Total: %d sessions, %d registered [R], %d with active tmux\n" \
+    "$session_count" "$registered_count" "$active_tmux"
+  printf "  [R] = registered in active-sessions/ (running concurrently)\n\n"
 fi

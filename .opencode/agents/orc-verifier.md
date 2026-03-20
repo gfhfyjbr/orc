@@ -1,6 +1,6 @@
 ---
 description: "Orc verifier subagent — validates implementations against specifications through systematic checking and testing"
-mode: subagent
+mode: primary
 permission:
   edit: deny
   bash:

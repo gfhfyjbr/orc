@@ -1,6 +1,6 @@
 ---
 description: "Orc explorer subagent — studies codebases, collects structural facts, maps dependencies without making changes"
-mode: subagent
+mode: primary
 permission:
   edit: deny
   bash:

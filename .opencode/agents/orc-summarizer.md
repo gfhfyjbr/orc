@@ -1,6 +1,6 @@
 ---
 description: "Orc summarizer subagent — aggregates multiple agent outputs into a concise, unified summary without inventing new content"
-mode: subagent
+mode: primary
 permission:
   edit: deny
   bash:

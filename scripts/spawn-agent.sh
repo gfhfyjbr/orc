@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LEGACY — replaced by orc_agent spawn. Not used in production.
 # =============================================================================
 # spawn-agent.sh — Create a new tmux pane for a subagent and start OpenCode
 # =============================================================================
@@ -91,7 +92,7 @@ tmux select-pane -t "$NEW_PANE_ID" -T "wrk:${ROLE}:${RUN_ID}"
 # ---------------------------------------------------------------------------
 # Start OpenCode in the new pane
 # ---------------------------------------------------------------------------
-tmux send-keys -t "$NEW_PANE_ID" "cd $WORKDIR && opencode" Enter
+tmux send-keys -t "$NEW_PANE_ID" "cd $WORKDIR && opencode --agent orc-$ROLE" Enter
 
 # ---------------------------------------------------------------------------
 # Set up transcript logging via pipe-pane

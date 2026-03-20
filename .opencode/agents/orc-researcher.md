@@ -1,6 +1,6 @@
 ---
 description: "Orc researcher subagent — gathers facts, compares options, provides recommendations with confidence levels and citations"
-mode: subagent
+mode: primary
 permission:
   edit: deny
   bash:

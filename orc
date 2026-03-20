@@ -31,14 +31,40 @@ source "$SCRIPT_DIR/lib.sh"
 resolve_latest_sid() {
   local root
   root=$(get_project_root)
-  local latest_file="$root/$ORC_DIR/latest-session"
 
+  # Priority 1: Explicit env var
+  if [ -n "${ORC_SESSION_ID:-}" ]; then
+    printf '%s' "$ORC_SESSION_ID"
+    return 0
+  fi
+
+  # Priority 2: Most recent active session from active-sessions/
+  local active_dir="$root/$ORC_DIR/active-sessions"
+  if [ -d "$active_dir" ]; then
+    local newest=""
+    for f in "$active_dir"/session-*; do
+      [ -f "$f" ] || continue
+      local candidate
+      candidate=$(basename "$f")
+      # Among active sessions, pick the most recently registered (lexicographic = chronological)
+      if [ -z "$newest" ] || [[ "$candidate" > "$newest" ]]; then
+        newest="$candidate"
+      fi
+    done
+    if [ -n "$newest" ]; then
+      printf '%s' "$newest"
+      return 0
+    fi
+  fi
+
+  # Priority 3: Fallback to latest-session file (backward compat)
+  local latest_file="$root/$ORC_DIR/latest-session"
   if [ -f "$latest_file" ]; then
     cat "$latest_file"
     return 0
   fi
 
-  # Fallback: find most recent session dir
+  # Priority 4: Most recent session dir
   local latest
   latest=$(ls -1d "$root/$ORC_DIR/sessions"/session-* 2>/dev/null | sort -r | head -1)
   if [ -n "$latest" ]; then

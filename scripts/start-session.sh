@@ -71,6 +71,31 @@ if git -C "$WORKDIR" rev-parse --is-inside-work-tree &>/dev/null; then
   WORKTREE_BRANCH=$(get_session_branch "$SID")
   WORKTREE_PATH=$(create_session_worktree "$SID" "$WORKDIR")
   log_event "$SESSION_DIR" "info" "Worktree: $WORKTREE_PATH (branch: $WORKTREE_BRANCH)"
+
+  # Sync working files from main tree into worktree.
+  # Worktree is created from HEAD commit, so any uncommitted changes
+  # (new agents, modified scripts, tools/plugins) would be missing.
+  # rsync ensures the worktree always has the latest state.
+  if [ "$WORKTREE_PATH" != "$WORKDIR" ]; then
+    # .opencode/ — agents, tools, plugins
+    [ -d "$WORKDIR/.opencode" ] && rsync -a --delete "$WORKDIR/.opencode/" "$WORKTREE_PATH/.opencode/"
+    # scripts/ — lib.sh, watchdog, spawn-agent etc.
+    [ -d "$WORKDIR/scripts" ] && rsync -a --delete "$WORKDIR/scripts/" "$WORKTREE_PATH/scripts/"
+    # orc_agent, orc — main executables
+    [ -f "$WORKDIR/orc_agent" ] && cp -f "$WORKDIR/orc_agent" "$WORKTREE_PATH/orc_agent"
+    [ -f "$WORKDIR/orc" ] && cp -f "$WORKDIR/orc" "$WORKTREE_PATH/orc"
+    # templates/ — prompt templates and role specs
+    [ -d "$WORKDIR/templates" ] && rsync -a --delete "$WORKDIR/templates/" "$WORKTREE_PATH/templates/"
+    # opencode.json — project config
+    [ -f "$WORKDIR/opencode.json" ] && cp -f "$WORKDIR/opencode.json" "$WORKTREE_PATH/opencode.json"
+    # AGENTS.md — instructions
+    [ -f "$WORKDIR/AGENTS.md" ] && cp -f "$WORKDIR/AGENTS.md" "$WORKTREE_PATH/AGENTS.md"
+    # .orchestrator/ — symlink so subagents can access sessions/runs locally
+    if [ ! -e "$WORKTREE_PATH/.orchestrator" ]; then
+      ln -s "$WORKDIR/.orchestrator" "$WORKTREE_PATH/.orchestrator"
+    fi
+    log_event "$SESSION_DIR" "info" "Synced orc files from main tree to worktree"
+  fi
 fi
 
 # Save session metadata (with worktree info)
@@ -89,11 +114,12 @@ EOF
 # Initialize event log
 log_event "$SESSION_DIR" "info" "Session $SID created"
 
-# Save latest session pointer for convenience (kept for backward compat)
-echo "$SID" > "$WORKDIR/$ORC_DIR/latest-session"
-
 # Register in active-sessions directory (supports multiple concurrent sessions)
-register_active_session "$WORKDIR" "$SID"
+register_active_session "$WORKDIR" "$SID" "$WORKTREE_PATH"
+
+# Save latest session pointer for convenience (backward compat for scripts
+# that haven't been updated to use active-sessions/ yet)
+echo "$SID" > "$WORKDIR/$ORC_DIR/latest-session"
 
 orc_info "Session ID: $SID"
 orc_info "Session dir: $SESSION_DIR"
@@ -113,9 +139,14 @@ tmux new-session -d -s "$SESSION_NAME" -n main -x 220 -y 55
 
 tmux select-pane -t "$SESSION_NAME":main.0 -T "orc:main"
 
-# Start opencode in main window (gets full viewport)
-# Use worktree path if available for file isolation
-tmux send-keys -t "$SESSION_NAME":main.0 "cd $WORKTREE_PATH && OPENCODE_MESSAGE_QUEUE_MODE=hold opencode" Enter
+# Set ORC_SESSION_ID in tmux session environment — all panes/windows in this
+# tmux session inherit it, so orc_agent can resolve the correct session
+# even when multiple sessions run in parallel.
+tmux set-environment -t "$SESSION_NAME" ORC_SESSION_ID "$SID"
+
+# Start opencode in main window as orchestrator agent (gets full viewport)
+# --agent orc-orchestrator gives it the orchestrator role natively via opencode's agent system
+tmux send-keys -t "$SESSION_NAME":main.0 "cd $WORKTREE_PATH && export ORC_SESSION_ID=$SID && OPENCODE_MESSAGE_QUEUE_MODE=hold opencode --agent orc-orchestrator" Enter
 
 # Go back to main window
 tmux select-window -t "$SESSION_NAME":main
@@ -137,64 +168,10 @@ WATCHDOG_PID=$!
 echo "$WATCHDOG_PID" > "$SESSION_DIR/.watchdog_pid"
 log_event "$SESSION_DIR" "info" "Watchdog started: PID $WATCHDOG_PID"
 
-# ---------------------------------------------------------------------------
-# Wait for OpenCode to start, then send system prompt
-# ---------------------------------------------------------------------------
-orc_info "Waiting for OpenCode to start in main pane..."
-sleep 5  # Give opencode time to initialize its TUI
-
-if wait_for_prompt "$MAIN_PANE_ID" 30; then
-  # Write the full system prompt to a file (not inline — too large for paste-buffer)
-  SYSTEM_PROMPT_FILE="$SCRIPT_DIR/../templates/prompts/main-agent-system.md"
-  INIT_PROMPT_FILE="$SESSION_DIR/init-prompt.md"
-
-  if [ -f "$SYSTEM_PROMPT_FILE" ]; then
-    orc_info "Writing system prompt to file..."
-
-    # Build the combined system + session-specific prompt as a file
-    cat "$SYSTEM_PROMPT_FILE" > "$INIT_PROMPT_FILE"
-    cat >> "$INIT_PROMPT_FILE" <<INITEOF
-
----
-
-## SESSION INFO
-
-- Session ID: $SID
-- Your pane ID: $MAIN_PANE_ID
-- Working directory: $WORKTREE_PATH
-- Project root: $WORKDIR
-- Session branch: $WORKTREE_BRANCH
-
-## QUICK REFERENCE
-
-\`\`\`bash
-# Spawn subagent (non-blocking):
-./orc_agent spawn explorer "map the project structure"
-./orc_agent spawn researcher "compare X vs Y"
-
-# Batch spawn (parallel — & runs in background, wait collects all):
-./orc_agent spawn explorer "goal" & ./orc_agent spawn researcher "goal2" & wait
-
-# Reply to a specific agent pane:
-./orc_agent reply <pane_id> "follow-up message"
-
-# List agents:
-./orc_agent list
-\`\`\`
-
-Subagent replies arrive as new messages prefixed with their run_id.
-INITEOF
-
-    # Send a SHORT, forceful prompt
-    SHORT_PROMPT="Read \`$INIT_PROMPT_FILE\` now. You are an ORCHESTRATOR. You delegate ALL work via \`./orc_agent spawn <role> \"goal\"\`. NEVER read files or do work yourself. Subagent replies will arrive as messages."
-    send_prompt "$MAIN_PANE_ID" "$SHORT_PROMPT"
-    log_event "$SESSION_DIR" "info" "System prompt file written, short init sent to main agent"
-  else
-    orc_warn "System prompt template not found at $SYSTEM_PROMPT_FILE"
-  fi
-else
-  orc_warn "Could not detect OpenCode readiness. Main agent may need manual prompt."
-fi
+# No init-prompt needed — the orc-orchestrator agent definition in
+# .opencode/agents/orc-orchestrator.md provides all instructions natively.
+# OpenCode loads it automatically via --agent orc-orchestrator.
+log_event "$SESSION_DIR" "info" "Orchestrator agent started via --agent orc-orchestrator"
 
 # ---------------------------------------------------------------------------
 # Output — session_id to stdout (for scripting), everything else to stderr

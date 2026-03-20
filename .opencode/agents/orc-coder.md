@@ -1,6 +1,6 @@
 ---
 description: "Orc coder subagent — writes, modifies, and refactors code. The ONLY orc role allowed to modify source files."
-mode: subagent
+mode: primary
 permission:
   edit: allow
   bash:

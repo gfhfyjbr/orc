@@ -103,6 +103,12 @@ if session_exists "$SESSION_NAME"; then
 fi
 
 # ---------------------------------------------------------------------------
+# Final commit+push before cleanup (save any uncommitted agent work)
+# ---------------------------------------------------------------------------
+
+session_commit_and_push "$SESSION_DIR" "orc: final commit before abort ($SID)" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
 # Clean up worktree (but keep the branch for history)
 # ---------------------------------------------------------------------------
 

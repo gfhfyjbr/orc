@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# LEGACY — replaced by orc_agent spawn. Not used in production.
 # =============================================================================
 # send-task.sh — Send bootstrap prompt to a subagent via paste-buffer
 # =============================================================================
@@ -60,8 +61,9 @@ fi
 # ---------------------------------------------------------------------------
 # Generate bootstrap prompt
 # ---------------------------------------------------------------------------
-generate_bootstrap_prompt "$RUN_DIR"
-orc_info "Bootstrap prompt generated: $RUN_DIR/prompt.txt"
+# LEGACY: generate_bootstrap_prompt was removed from lib.sh
+# generate_bootstrap_prompt "$RUN_DIR"
+orc_info "Bootstrap prompt expected at: $RUN_DIR/prompt.txt"
 
 # ---------------------------------------------------------------------------
 # Wait for OpenCode to be ready
