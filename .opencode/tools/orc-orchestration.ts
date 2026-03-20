@@ -1,24 +1,26 @@
 import { tool } from "@opencode-ai/plugin"
 
+const VALID_ROLES = [
+  "explorer",
+  "researcher",
+  "coder",
+  "reviewer",
+  "summarizer",
+  "verifier",
+] as const
+
 /**
  * Spawn a new subagent with a specific role and goal.
  * Tool name: orc-orchestration_spawn
  */
 export const spawn = tool({
   description:
-    "Spawn a new subagent with a specific role and goal. " +
-    "Only the orchestrator (main agent) should use this. " +
+    "Spawn a single subagent. For spawning multiple agents at once, " +
+    "use orc-orchestration_spawn_batch instead (parallel, much faster). " +
     "Returns: SPAWNED run-NNN %NN role",
   args: {
     role: tool.schema
-      .enum([
-        "explorer",
-        "researcher",
-        "coder",
-        "reviewer",
-        "summarizer",
-        "verifier",
-      ])
+      .enum([...VALID_ROLES])
       .describe("Agent role"),
     goal: tool.schema
       .string()
@@ -39,6 +41,57 @@ export const spawn = tool({
       const msg = err instanceof Error ? err.message : String(err)
       return `ERROR spawning ${args.role} agent: ${msg}`
     }
+  },
+})
+
+/**
+ * Spawn multiple subagents in parallel. Much faster than calling spawn repeatedly.
+ * Tool name: orc-orchestration_spawn_batch
+ */
+export const spawn_batch = tool({
+  description:
+    "Spawn multiple subagents in PARALLEL. Use this instead of calling spawn " +
+    "multiple times — all agents start simultaneously. " +
+    "Returns results for each agent.",
+  args: {
+    agents: tool.schema
+      .array(
+        tool.schema.object({
+          role: tool.schema
+            .enum([...VALID_ROLES])
+            .describe("Agent role"),
+          goal: tool.schema
+            .string()
+            .describe("Detailed task description for the agent"),
+        }),
+      )
+      .describe("Array of agents to spawn, each with a role and goal"),
+  },
+  async execute(args, context) {
+    if (process.env.ORC_IS_SUBAGENT === "1") {
+      return "ERROR: Subagents are not allowed to spawn other agents."
+    }
+
+    if (!args.agents || args.agents.length === 0) {
+      return "ERROR: No agents specified."
+    }
+
+    const results = await Promise.all(
+      args.agents.map(async (agent) => {
+        try {
+          const result =
+            await Bun.$`./orc_agent spawn ${agent.role} ${agent.goal}`.cwd(
+              context.worktree,
+            )
+          return result.text().trim()
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err)
+          return `ERROR spawning ${agent.role}: ${msg}`
+        }
+      }),
+    )
+
+    return results.join("\n")
   },
 })
 
@@ -102,15 +155,63 @@ export const retry = tool({
   },
   async execute(args, context) {
     try {
-      const goalArg = args.new_goal || ""
-      const result =
-        await Bun.$`./orc_agent retry ${args.run_id} ${goalArg}`.cwd(
-          context.worktree,
-        )
+      const result = args.new_goal
+        ? await Bun.$`./orc_agent retry ${args.run_id} ${args.new_goal}`.cwd(
+            context.worktree,
+          )
+        : await Bun.$`./orc_agent retry ${args.run_id}`.cwd(context.worktree)
       return result.text().trim()
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err)
       return `ERROR retrying ${args.run_id}: ${msg}`
+    }
+  },
+})
+
+/**
+ * Reassign a completed agent's pane with a new role and task.
+ * Faster than spawn — reuses the existing pane and skips OpenCode startup.
+ * Tool name: orc-orchestration_reassign
+ */
+export const reassign = tool({
+  description:
+    "Reuse a completed agent's pane with a new role and task. " +
+    "Faster than spawn — skips OpenCode startup time. " +
+    "If run_id is omitted, auto-picks the first available done pane.",
+  args: {
+    role: tool.schema
+      .enum([...VALID_ROLES])
+      .describe("New agent role"),
+    goal: tool.schema
+      .string()
+      .describe("New task description"),
+    run_id: tool.schema
+      .string()
+      .optional()
+      .describe("Specific completed run ID to reuse (e.g. run-001). If omitted, auto-picks first available."),
+  },
+  async execute(args, context) {
+    if (process.env.ORC_IS_SUBAGENT === "1") {
+      return "ERROR: Subagents cannot reassign agents."
+    }
+
+    try {
+      if (args.run_id) {
+        const result =
+          await Bun.$`./orc_agent reassign ${args.run_id} ${args.role} ${args.goal}`.cwd(
+            context.worktree,
+          )
+        return result.text().trim()
+      } else {
+        const result =
+          await Bun.$`./orc_agent reassign ${args.role} ${args.goal}`.cwd(
+            context.worktree,
+          )
+        return result.text().trim()
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      return `ERROR reassigning: ${msg}`
     }
   },
 })

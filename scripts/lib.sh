@@ -36,20 +36,26 @@ NC='\033[0m' # No Color
 acquire_lock() {
   local lock_path="$1"
   local timeout="${2:-10}"
-  local elapsed=0
+  local start_time=$(date +%s)
   local sleep_interval=0.1
 
-  while [ "$elapsed" -lt "$timeout" ]; do
+  while true; do
+    local now=$(date +%s)
+    local elapsed=$((now - start_time))
+    if [ "$elapsed" -ge "$timeout" ]; then
+      orc_warn "Lock acquisition timed out after ${elapsed}s: $lock_path"
+      return 1
+    fi
+
     if mkdir "$lock_path" 2>/dev/null; then
       # Lock acquired — record our PID for stale detection
-      echo $$ > "$lock_path/pid"
+      echo $$ > "$lock_path/pid" 2>/dev/null
       return 0
     fi
 
     # Lock exists — check if holder is still alive (stale lock detection)
     if [ -f "$lock_path/pid" ]; then
-      local holder_pid
-      holder_pid=$(cat "$lock_path/pid" 2>/dev/null || echo "")
+      local holder_pid=$(cat "$lock_path/pid" 2>/dev/null)
       if [ -n "$holder_pid" ] && ! kill -0 "$holder_pid" 2>/dev/null; then
         # Holder is dead — remove stale lock and retry immediately
         rm -rf "$lock_path" 2>/dev/null || true
@@ -58,16 +64,13 @@ acquire_lock() {
     fi
 
     sleep "$sleep_interval"
-    elapsed=$((elapsed + 1))
     # Back off: 0.1 -> 0.2 -> 0.5 -> 1s
-    case "$elapsed" in
-      [1-3]) sleep_interval=0.2 ;;
-      [4-6]) sleep_interval=0.5 ;;
-      *)     sleep_interval=1 ;;
+    case "$sleep_interval" in
+      0.1) sleep_interval=0.2 ;;
+      0.2) sleep_interval=0.5 ;;
+      0.5) sleep_interval=1 ;;
     esac
   done
-
-  return 1  # Timeout
 }
 
 # Release a lock.
@@ -154,7 +157,9 @@ generate_run_id() {
 # ---------------------------------------------------------------------------
 
 # Get the project root (where .orchestrator/ lives)
-# Walks up from CWD looking for .orchestrator/ or .git/ (supports git worktrees)
+# Walks up from CWD looking for .orchestrator/ or .git/
+# For git worktrees (.git is a file), resolves to the MAIN repo root
+# so that .orchestrator/sessions/ is always reachable.
 get_project_root() {
   local dir="$PWD"
   while [ "$dir" != "/" ]; do
@@ -162,8 +167,27 @@ get_project_root() {
       printf '%s' "$dir"
       return 0
     fi
-    # Support both regular repos (.git is dir) and worktrees (.git is file)
-    if [ -d "$dir/.git" ] || [ -f "$dir/.git" ]; then
+    if [ -d "$dir/.git" ]; then
+      # Regular repo — this is the real root
+      printf '%s' "$dir"
+      return 0
+    fi
+    if [ -f "$dir/.git" ]; then
+      # Git worktree — .git is a file with "gitdir: /path/to/main/.git/worktrees/..."
+      # Resolve to the main repo root where .orchestrator/ lives
+      local main_git_dir
+      main_git_dir=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null || echo "")
+      if [ -n "$main_git_dir" ]; then
+        # --git-common-dir returns the shared .git dir (e.g. /path/to/main/.git)
+        # Parent of that is the project root
+        local main_root
+        main_root=$(cd "$main_git_dir/.." 2>/dev/null && pwd)
+        if [ -d "$main_root/.orchestrator" ] || [ -d "$main_root/.git" ]; then
+          printf '%s' "$main_root"
+          return 0
+        fi
+      fi
+      # Fallback: return worktree dir if resolution failed
       printf '%s' "$dir"
       return 0
     fi
@@ -477,9 +501,17 @@ EOF
 register_active_session() {
   local root="$1"
   local sid="$2"
+  local worktree_path="${3:-$root}"
   local active_dir="$root/$ORC_DIR/active-sessions"
   mkdir -p "$active_dir"
-  echo "$$" > "$active_dir/$sid"
+  # Store worktree path (for orc attach/list) and PID (for liveness check)
+  jq -n \
+    --arg sid "$sid" \
+    --arg worktree_path "$worktree_path" \
+    --arg pid "$$" \
+    --arg registered_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{session_id:$sid,worktree_path:$worktree_path,pid:($pid|tonumber),registered_at:$registered_at}' \
+    > "$active_dir/$sid"
 }
 
 # Deregister a session (called on abort/finish).
@@ -550,7 +582,7 @@ create_session_worktree() {
 
   # Create the worktree
   mkdir -p "$(dirname "$worktree_dir")"
-  if git -C "$project_root" worktree add "$worktree_dir" "$branch" 2>/dev/null; then
+  if git -C "$project_root" worktree add "$worktree_dir" "$branch" >/dev/null 2>&1; then
     orc_ok "Created worktree: $worktree_dir (branch: $branch)"
     printf '%s' "$worktree_dir"
     return 0
@@ -660,6 +692,60 @@ session_push() {
 
   orc_ok "Pushed branch $branch to $remote"
   return 0
+}
+
+# Commit and push in one call — convenience wrapper for auto-commit flows.
+# Usage: session_commit_and_push <session_dir> <message>
+# Reads worktree_path and worktree_branch from session.json.
+# Returns: 0 on success (or nothing to commit), 1 on error
+session_commit_and_push() {
+  local session_dir="$1"
+  local message="$2"
+  local session_json="$session_dir/session.json"
+
+  # Get worktree path and branch from session.json
+  local worktree_path
+  worktree_path=$(jq -r '.worktree_path // empty' "$session_json" 2>/dev/null)
+  local branch
+  branch=$(jq -r '.worktree_branch // empty' "$session_json" 2>/dev/null)
+
+  if [ -z "$worktree_path" ] || [ -z "$branch" ]; then
+    orc_warn "No worktree configured for session — skipping commit+push"
+    return 1
+  fi
+
+  # Stage all changes
+  git -C "$worktree_path" add -A 2>/dev/null || {
+    orc_error "git add failed in $worktree_path"
+    return 1
+  }
+
+  # Check if there are changes to commit
+  if git -C "$worktree_path" diff --cached --quiet 2>/dev/null; then
+    orc_info "No changes to commit"
+    return 0
+  fi
+
+  # Commit
+  git -C "$worktree_path" commit -m "$message" --no-verify 2>/dev/null || {
+    orc_warn "git commit returned non-zero (possibly nothing staged)"
+    return 0
+  }
+
+  orc_ok "Committed: $message"
+
+  # Push (create remote branch if needed)
+  git -C "$worktree_path" push -u origin "$branch" 2>/dev/null || \
+    orc_warn "Push failed (no remote or network issue)"
+
+  return 0
+}
+
+# Get session branch name from session.json (by session_dir path).
+# Usage: get_session_branch_from_dir <session_dir>
+get_session_branch_from_dir() {
+  local session_dir="$1"
+  jq -r '.worktree_branch // empty' "$session_dir/session.json" 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------

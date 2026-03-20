@@ -33,13 +33,53 @@ AGENT_TIMEOUT="${ORC_AGENT_TIMEOUT:-180}"
 # ---------------------------------------------------------------------------
 
 resolve_current_session() {
+  # Priority 1: Explicit env var (set by orchestrator or subagent prompt)
+  if [ -n "${ORC_SESSION_ID:-}" ]; then
+    printf '%s' "$ORC_SESSION_ID"
+    return 0
+  fi
+
   local root
   root=$(get_project_root)
+
+  # Priority 2: Detect session from current tmux pane ID.
+  # If we're inside tmux, find which session owns our pane.
+  local my_pane=""
+  if [ -n "${TMUX:-}" ]; then
+    my_pane=$(tmux display-message -p '#{pane_id}' 2>/dev/null || echo "")
+  fi
+
+  if [ -n "$my_pane" ]; then
+    local active_dir="$root/$ORC_DIR/active-sessions"
+    if [ -d "$active_dir" ]; then
+      for reg_file in "$active_dir"/session-*; do
+        [ -f "$reg_file" ] || continue
+        local candidate_sid
+        candidate_sid=$(basename "$reg_file")
+        local candidate_dir="$root/$ORC_DIR/sessions/$candidate_sid"
+        [ -d "$candidate_dir" ] || continue
+
+        # Check if our pane belongs to this session's tmux session
+        local candidate_tmux
+        candidate_tmux=$(jq -r '.session_name // ""' "$candidate_dir/session.json" 2>/dev/null || echo "")
+        if [ -n "$candidate_tmux" ] && tmux has-session -t "$candidate_tmux" 2>/dev/null; then
+          # Check if our pane is in this tmux session
+          if tmux list-panes -s -t "$candidate_tmux" -F '#{pane_id}' 2>/dev/null | grep -qF "$my_pane"; then
+            printf '%s' "$candidate_sid"
+            return 0
+          fi
+        fi
+      done
+    fi
+  fi
+
+  # Priority 3: Fallback to latest-session (backward compat, single-session mode)
   local latest_file="$root/$ORC_DIR/latest-session"
   if [ -f "$latest_file" ]; then
     cat "$latest_file"
     return 0
   fi
+
   echo "ERROR: No active session. Run: ./orc start" >&2
   exit 1
 }
@@ -173,19 +213,18 @@ cmd_done() {
     fi
   fi
 
-  # Auto-commit for coder role: if this agent was a coder and there are changes, commit them
+  # Auto-commit and push: when any agent reports done, check for changes and commit+push
   local agent_role=""
   agent_role=$(jq -r '.role // ""' "$run_dir/.agent_meta.json" 2>/dev/null || echo "")
-  if [ "$agent_role" = "coder" ]; then
-    local agent_goal=""
-    agent_goal=$(jq -r '.goal // ""' "$run_dir/.agent_meta.json" 2>/dev/null || echo "")
-    # Truncate goal to 80 chars for commit message
-    local short_goal
-    short_goal=$(printf '%.80s' "$agent_goal")
-    local commit_msg="orc: [coder] $short_goal"
-    if session_commit "$WORKDIR" "$commit_msg" 2>/dev/null; then
-      log_event "$SESSION_DIR" "info" "auto-committed changes from $run_id (coder)"
-    fi
+  local agent_goal=""
+  agent_goal=$(jq -r '.goal // ""' "$run_dir/.agent_meta.json" 2>/dev/null || echo "")
+  # Truncate goal to 60 chars for commit message
+  local short_goal
+  short_goal=$(printf '%.60s' "$agent_goal")
+  local commit_msg="orc: [${agent_role:-unknown}] $short_goal"
+
+  if session_commit_and_push "$SESSION_DIR" "$commit_msg" 2>/dev/null; then
+    log_event "$SESSION_DIR" "info" "auto-commit+push from $run_id ($agent_role)"
   fi
 
   log_event "$SESSION_DIR" "info" "done $run_id"
@@ -199,16 +238,22 @@ cmd_done() {
 # Remove dead pane IDs from LAYOUT_FILE, keeping it in sync with tmux reality.
 # Must be called before any calculation that depends on LAYOUT_FILE contents.
 cleanup_layout_file() {
-  [ ! -f "$LAYOUT_FILE" ] && return
+  [ -f "$LAYOUT_FILE" ] || return 0
+  local layout_lock="$SESSION_DIR/.layout_lock"
+  acquire_lock "$layout_lock" 10 || {
+    orc_warn "cleanup_layout_file: couldn't acquire layout lock, skipping cleanup"
+    return 0
+  }
   local temp_file="${LAYOUT_FILE}.tmp.$$"
   : > "$temp_file"
   while IFS= read -r pane_id; do
-    [ -z "$pane_id" ] && continue
+    [ -n "$pane_id" ] || continue
     if pane_alive "$pane_id"; then
       echo "$pane_id" >> "$temp_file"
     fi
   done < "$LAYOUT_FILE"
   mv "$temp_file" "$LAYOUT_FILE"
+  release_lock "$layout_lock"
 }
 
 equalize_layout() {
@@ -484,8 +529,14 @@ ${project_context}"
 start_opencode_in_pane() {
   local pane="$1"
   local run_dir="$2"
+  local role="${3:-}"  # optional: if set, launch with --agent orc-$role
 
-  tmux send-keys -t "$pane" "export ORC_IS_SUBAGENT=1 && cd $WORKDIR && opencode" Enter
+  local agent_flag=""
+  if [ -n "$role" ]; then
+    agent_flag=" --agent orc-$role"
+  fi
+
+  tmux send-keys -t "$pane" "export ORC_IS_SUBAGENT=1 ORC_SESSION_ID=$SID && cd $WORKDIR && opencode${agent_flag}" Enter
   tmux pipe-pane -t "$pane" -o "cat >> $run_dir/transcript.log"
   tmux select-pane -t "$MAIN_PANE" 2>/dev/null || true
 
@@ -499,6 +550,48 @@ start_opencode_in_pane() {
     sleep 1
   done
   return 1
+}
+
+# Restart opencode in an existing pane with a (potentially different) agent role.
+# Used when reusing a pane for a different role — must exit the old opencode and
+# start a fresh one with --agent orc-$role to get correct permissions.
+restart_opencode_in_pane() {
+  local pane="$1"
+  local run_dir="$2"
+  local role="$3"
+
+  # Try graceful exit: Ctrl+C to cancel any operation, then Ctrl+Q to quit TUI
+  tmux send-keys -t "$pane" C-c
+  sleep 0.5
+  tmux send-keys -t "$pane" C-q
+  sleep 2
+
+  # Verify opencode has exited (check for shell prompt)
+  local exited=false
+  for _ in $(seq 1 10); do
+    local content
+    content=$(tmux capture-pane -t "$pane" -p -S -3 2>/dev/null || echo "")
+    if echo "$content" | grep -qE '(\$|%|#|❯)\s*$'; then
+      exited=true
+      break
+    fi
+    # Try Ctrl+C again in case opencode is stuck
+    tmux send-keys -t "$pane" C-c
+    sleep 1
+  done
+
+  if [ "$exited" != "true" ]; then
+    # Force kill the opencode process in this pane
+    local pane_pid
+    pane_pid=$(tmux display-message -t "$pane" -p '#{pane_pid}' 2>/dev/null || echo "")
+    if [ -n "$pane_pid" ]; then
+      pkill -P "$pane_pid" 2>/dev/null || true
+      sleep 2
+    fi
+  fi
+
+  # Start new opencode with correct agent
+  start_opencode_in_pane "$pane" "$run_dir" "$role"
 }
 
 send_task_to_pane() {
@@ -593,6 +686,8 @@ find_reusable_pane() {
 
 # Core reuse logic — /new + assign new role/task on existing pane
 # Usage: reuse_pane_for_task <old_run_dir> <role> <goal>
+# If role changed since last run, restarts opencode with --agent orc-<new_role>
+# to enforce correct agent permissions. If same role, uses fast /new path.
 reuse_pane_for_task() {
   local old_run_dir="$1"
   local role="$2"
@@ -601,6 +696,15 @@ reuse_pane_for_task() {
   local old_pane old_run_id
   old_pane=$(cat "$old_run_dir/.pane_id")
   old_run_id=$(basename "$old_run_dir")
+
+  # Check if role changed — need to restart opencode with different --agent
+  local old_role
+  old_role=$(jq -r '.role // ""' "$old_run_dir/.agent_meta.json" 2>/dev/null || echo "")
+  local role_changed=false
+  if [ "$old_role" != "$role" ]; then
+    role_changed=true
+    log_event "$SESSION_DIR" "info" "role change detected: $old_role -> $role (pane=$old_pane), will restart opencode"
+  fi
 
   # Create new run
   local run_id run_dir
@@ -628,24 +732,31 @@ reuse_pane_for_task() {
     '{run_id:$run_id,role:$role,pane_id:$pane_id,goal:$goal,col:$col,row:$row,spawned_at:$spawned_at,reused_from:$reused_from}' \
     > "$run_dir/.agent_meta.json"
 
-  # /new to reset OpenCode conversation
-  tmux send-keys -t "$old_pane" -l "/new"
-  sleep 0.5
-  tmux send-keys -t "$old_pane" Enter
-  sleep 2
+  if [ "$role_changed" = "true" ]; then
+    # Role changed — restart opencode with new --agent flag for correct permissions
+    restart_opencode_in_pane "$old_pane" "$run_dir" "$role"
+    # Extra settle time after restart
+    sleep 2
+  else
+    # Same role — fast path: /new to reset OpenCode conversation
+    tmux send-keys -t "$old_pane" -l "/new"
+    sleep 0.5
+    tmux send-keys -t "$old_pane" Enter
+    sleep 2
 
-  # Wait for OpenCode readiness after /new
-  for _ in $(seq 1 20); do
-    local content
-    content=$(tmux capture-pane -t "$old_pane" -p -S -5 2>/dev/null || echo "")
-    if echo "$content" | grep -qE '(Ask anything|ctrl\+p commands|MCP /status)'; then
-      break
-    fi
-    sleep 1
-  done
+    # Wait for OpenCode readiness after /new
+    for _ in $(seq 1 20); do
+      local content
+      content=$(tmux capture-pane -t "$old_pane" -p -S -5 2>/dev/null || echo "")
+      if echo "$content" | grep -qE '(Ask anything|ctrl\+p commands|MCP /status)'; then
+        break
+      fi
+      sleep 1
+    done
 
-  # Extra settle time after /new — prevents empty-message race (OpenCode #17387)
-  sleep 2
+    # Extra settle time after /new — prevents empty-message race (OpenCode #17387)
+    sleep 2
+  fi
 
   # Setup transcript logging for new run
   tmux pipe-pane -t "$old_pane" -o "cat >> $run_dir/transcript.log"
@@ -787,7 +898,7 @@ cmd_spawn() {
   equalize_layout
   record_spawn_time "$run_dir"
 
-  if ! start_opencode_in_pane "$new_pane" "$run_dir"; then
+  if ! start_opencode_in_pane "$new_pane" "$run_dir" "$role"; then
     echo "SPAWN_ERROR $run_id $new_pane $role — OpenCode not ready"
     exit 1
   fi
@@ -796,7 +907,18 @@ cmd_spawn() {
   sleep 2
 
   local task_prompt
-  task_prompt=$(build_task_prompt "$role" "$run_id" "$run_dir" "$goal")
+  if ! task_prompt=$(build_task_prompt "$role" "$run_id" "$run_dir" "$goal"); then
+    orc_err "Failed to build task prompt for $run_id — cleaning up orphaned pane"
+    tmux kill-pane -t "$new_pane" 2>/dev/null || true
+    # Remove from layout file
+    if [ -f "$LAYOUT_FILE" ]; then
+      local temp_file="${LAYOUT_FILE}.tmp.$$"
+      grep -v "^${new_pane}$" "$LAYOUT_FILE" > "$temp_file" 2>/dev/null || true
+      mv "$temp_file" "$LAYOUT_FILE"
+    fi
+    rm -rf "$run_dir"
+    return 1
+  fi
   send_task_to_pane "$new_pane" "$task_prompt"
 
   log_event "$SESSION_DIR" "info" "spawned $run_id ($role) pane=$new_pane c${target_col}r${target_row}"
@@ -852,7 +974,7 @@ cmd_spawn_window() {
   record_spawn_time "$run_dir"
   tmux select-window -t "$SESSION_NAME":main 2>/dev/null || true
 
-  if ! start_opencode_in_pane "$new_pane" "$run_dir"; then
+  if ! start_opencode_in_pane "$new_pane" "$run_dir" "$role"; then
     echo "SPAWN_ERROR $run_id $new_pane $role — not ready"
     exit 1
   fi

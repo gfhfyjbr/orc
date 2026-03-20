@@ -1,6 +1,6 @@
 ---
 description: "Orc reviewer subagent — finds holes, risks, contradictions in proposals, code changes, and architectural decisions"
-mode: subagent
+mode: primary
 permission:
   edit: deny
   bash:
@@ -9,6 +9,8 @@ permission:
     "git show*": allow
     "git status*": allow
     "grep *": allow
+    "./orc_agent *": allow
+    "./orc *": allow
     "*": ask
 tools:
   write: false

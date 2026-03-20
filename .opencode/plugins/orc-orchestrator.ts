@@ -102,13 +102,13 @@ export const OrcOrchestrator: Plugin = async ({
     "tool.execute.before": async (input, output) => {
       const toolName = input.tool ?? ""
 
-      // Guard: subagents must not spawn other agents
+      // Guard: subagents must not spawn or reassign agents
       if (
         isSubagent &&
-        (toolName === "orc-orchestration_spawn" ||
-          toolName === "orc-orchestration_spawn-window")
+        (toolName.startsWith("orc-orchestration_spawn") ||
+          toolName === "orc-orchestration_reassign")
       ) {
-        throw new Error("Subagents cannot spawn other agents")
+        throw new Error("Subagents cannot spawn or reassign agents")
       }
 
       // Log all orc-* tool invocations
